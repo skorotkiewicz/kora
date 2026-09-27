@@ -315,13 +315,19 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> gt
             } else if control && key == gtk::gdk::Key::v {
                 explorer.paste();
                 true
+            } else if control && key == gtk::gdk::Key::l {
+                explorer.path_entry.grab_focus();
+                true
+            } else if control && key == gtk::gdk::Key::q {
+                explorer.confirm_quit();
+                true
             } else {
                 false
             };
             handled.into()
         }
     });
-    grid.add_controller(keys);
+    panel.add_controller(keys);
     let context_click = gtk::GestureClick::new();
     context_click.set_button(3);
     context_click.connect_pressed({
@@ -510,6 +516,7 @@ impl Explorer {
         entry.set_accessible_role(gtk::AccessibleRole::TextBox);
         dialog.content_area().append(&entry);
         dialog.set_default_response(gtk::ResponseType::Accept);
+        gtk::prelude::GtkWindowExt::set_focus(&dialog, Some(&entry));
         dialog.connect_response({
             let explorer = Rc::downgrade(self);
             move |dialog, response| {
@@ -546,6 +553,7 @@ impl Explorer {
         );
         dialog.add_button("Cancel", gtk::ResponseType::Cancel);
         dialog.add_button("Move to Trash", gtk::ResponseType::Accept);
+        dialog.set_default_response(gtk::ResponseType::Cancel);
         dialog.connect_response({
             let explorer = Rc::downgrade(self);
             move |dialog, response| {
@@ -558,6 +566,29 @@ impl Explorer {
                 }
                 dialog.close();
             }
+        });
+        dialog.present();
+    }
+
+    fn confirm_quit(&self) {
+        let Some(parent) = self.path_entry.root().and_downcast::<gtk::Window>() else {
+            return;
+        };
+        let dialog = gtk::MessageDialog::new(
+            Some(&parent),
+            gtk::DialogFlags::MODAL,
+            gtk::MessageType::Question,
+            gtk::ButtonsType::None,
+            "Quit Kora? Active file operations will finish before exit.",
+        );
+        dialog.add_button("Cancel", gtk::ResponseType::Cancel);
+        dialog.add_button("Quit Safely", gtk::ResponseType::Accept);
+        dialog.set_default_response(gtk::ResponseType::Cancel);
+        dialog.connect_response(move |dialog, response| {
+            if response == gtk::ResponseType::Accept {
+                parent.close();
+            }
+            dialog.close();
         });
         dialog.present();
     }

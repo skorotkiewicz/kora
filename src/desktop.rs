@@ -86,6 +86,25 @@ fn install_panel_input_region(window: &gtk::ApplicationWindow, panel: &impl IsA<
     });
 }
 
+fn install_safe_close(window: &gtk::ApplicationWindow, operations: &Rc<OperationQueue>) {
+    window.connect_close_request({
+        let operations = operations.clone();
+        move |window| {
+            if !operations.is_active() {
+                return glib::Propagation::Proceed;
+            }
+            window.set_visible(false);
+            let weak = window.downgrade();
+            operations.when_idle(move || {
+                if let Some(window) = weak.upgrade() {
+                    window.close();
+                }
+            });
+            glib::Propagation::Stop
+        }
+    });
+}
+
 fn make_window_transparent(window: &gtk::ApplicationWindow) {
     let provider = gtk::CssProvider::new();
     provider.load_from_data(".kora-window { background-color: transparent; }");
@@ -179,6 +198,7 @@ fn create_wayland_view(
     window.set_exclusive_zone(-1);
     window.set_keyboard_mode(KeyboardMode::None);
 
+    install_safe_close(&window, &operations);
     let (content, panel) = build_view(&settings, config.home(), operations);
     let click = gtk::GestureClick::new();
     click.connect_pressed({
@@ -324,6 +344,7 @@ fn create_x11_view(
         .default_height(geometry.height())
         .build();
     make_window_transparent(&window);
+    install_safe_close(&window, &operations);
     let (content, panel) = build_view(&settings, config.home(), operations);
     window.set_child(Some(&content));
     gtk::prelude::WidgetExt::realize(&window);

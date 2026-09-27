@@ -89,6 +89,7 @@ pub struct OperationQueue {
     results: Arc<Mutex<VecDeque<OperationResult>>>,
     holds: Rc<std::cell::RefCell<VecDeque<gio::ApplicationHoldGuard>>>,
     clipboard: std::cell::RefCell<Option<(bool, Vec<PathBuf>)>>,
+    idle_callbacks: Rc<std::cell::RefCell<Vec<Box<dyn FnOnce()>>>>,
     next_id: std::cell::Cell<u64>,
     app: gtk::Application,
 }
@@ -130,9 +131,11 @@ impl OperationQueue {
         let holds = Rc::new(std::cell::RefCell::new(
             VecDeque::<gio::ApplicationHoldGuard>::new(),
         ));
+        let idle_callbacks = Rc::new(std::cell::RefCell::new(Vec::<Box<dyn FnOnce()>>::new()));
         let source_results = results.clone();
         let source_listeners = listeners.clone();
         let source_holds = holds.clone();
+        let source_idle_callbacks = idle_callbacks.clone();
         glib::source::unix_fd_add_local(reader.as_raw_fd(), glib::IOCondition::IN, move |_, _| {
             let mut bytes = [0; 64];
             let completed = match reader.read(&mut bytes) {
@@ -159,6 +162,11 @@ impl OperationQueue {
             for _ in 0..completed {
                 source_holds.borrow_mut().pop_front();
             }
+            if source_holds.borrow().is_empty() {
+                for callback in source_idle_callbacks.take() {
+                    callback();
+                }
+            }
             glib::ControlFlow::Continue
         });
 
@@ -168,6 +176,7 @@ impl OperationQueue {
             results,
             holds,
             clipboard: std::cell::RefCell::new(None),
+            idle_callbacks,
             next_id: std::cell::Cell::new(1),
             app: app.clone(),
         })
@@ -196,6 +205,18 @@ impl OperationQueue {
 
     pub fn clipboard(&self) -> Option<(bool, Vec<PathBuf>)> {
         self.clipboard.borrow().clone()
+    }
+
+    pub fn is_active(&self) -> bool {
+        !self.holds.borrow().is_empty()
+    }
+
+    pub fn when_idle(&self, callback: impl FnOnce() + 'static) {
+        if self.is_active() {
+            self.idle_callbacks.borrow_mut().push(Box::new(callback));
+        } else {
+            callback();
+        }
     }
 
     fn submit(&self, request: Request) -> Result<(), String> {
