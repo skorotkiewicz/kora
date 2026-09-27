@@ -7,7 +7,11 @@ use std::{
 use gtk::{gio, glib, prelude::*};
 use gtk4 as gtk;
 
-use crate::operations::OperationQueue;
+use crate::operations::{Operation, OperationQueue};
+
+fn trash_operation(paths: Vec<PathBuf>, confirmed: bool) -> Option<Operation> {
+    confirmed.then_some(Operation::Trash { paths })
+}
 
 #[cfg(test)]
 use std::{fs, path::Path};
@@ -215,8 +219,15 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> gt
     popover.set_accessible_role(gtk::AccessibleRole::Menu);
     let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let open = gtk::Button::with_label("Open");
-    open.set_accessible_role(gtk::AccessibleRole::MenuItem);
-    menu.append(&open);
+    let rename = gtk::Button::with_label("Rename");
+    let copy = gtk::Button::with_label("Copy");
+    let cut = gtk::Button::with_label("Cut");
+    let paste = gtk::Button::with_label("Paste");
+    let trash = gtk::Button::with_label("Move to Trash");
+    for button in [&open, &rename, &copy, &cut, &paste, &trash] {
+        button.set_accessible_role(gtk::AccessibleRole::MenuItem);
+        menu.append(button);
+    }
     popover.set_child(Some(&menu));
     open.connect_clicked({
         let explorer = Rc::downgrade(&explorer);
@@ -231,6 +242,86 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> gt
             popover.popdown();
         }
     });
+    rename.connect_clicked({
+        let explorer = Rc::downgrade(&explorer);
+        let popover = popover.clone();
+        move |_| {
+            if let Some(explorer) = explorer.upgrade() {
+                explorer.show_rename();
+            }
+            popover.popdown();
+        }
+    });
+    copy.connect_clicked({
+        let explorer = Rc::downgrade(&explorer);
+        let popover = popover.clone();
+        move |_| {
+            if let Some(explorer) = explorer.upgrade() {
+                explorer.copy_selected(false);
+            }
+            popover.popdown();
+        }
+    });
+    cut.connect_clicked({
+        let explorer = Rc::downgrade(&explorer);
+        let popover = popover.clone();
+        move |_| {
+            if let Some(explorer) = explorer.upgrade() {
+                explorer.copy_selected(true);
+            }
+            popover.popdown();
+        }
+    });
+    paste.connect_clicked({
+        let explorer = Rc::downgrade(&explorer);
+        let popover = popover.clone();
+        move |_| {
+            if let Some(explorer) = explorer.upgrade() {
+                explorer.paste();
+            }
+            popover.popdown();
+        }
+    });
+    trash.connect_clicked({
+        let explorer = Rc::downgrade(&explorer);
+        let popover = popover.clone();
+        move |_| {
+            if let Some(explorer) = explorer.upgrade() {
+                explorer.confirm_trash();
+            }
+            popover.popdown();
+        }
+    });
+    let keys = gtk::EventControllerKey::new();
+    keys.connect_key_pressed({
+        let explorer = Rc::downgrade(&explorer);
+        move |_, key, _, modifiers| {
+            let Some(explorer) = explorer.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            let control = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK);
+            let handled = if key == gtk::gdk::Key::F2 {
+                explorer.show_rename();
+                true
+            } else if key == gtk::gdk::Key::Delete {
+                explorer.confirm_trash();
+                true
+            } else if control && key == gtk::gdk::Key::c {
+                explorer.copy_selected(false);
+                true
+            } else if control && key == gtk::gdk::Key::x {
+                explorer.copy_selected(true);
+                true
+            } else if control && key == gtk::gdk::Key::v {
+                explorer.paste();
+                true
+            } else {
+                false
+            };
+            handled.into()
+        }
+    });
+    grid.add_controller(keys);
     let context_click = gtk::GestureClick::new();
     context_click.set_button(3);
     context_click.connect_pressed({
@@ -353,12 +444,137 @@ impl Explorer {
         }
     }
 
+    fn selected_paths(&self) -> Vec<PathBuf> {
+        let current = self.current.borrow();
+        (0..self.selection.n_items())
+            .filter(|position| self.selection.is_selected(*position))
+            .filter_map(|position| {
+                self.selection
+                    .item(position)
+                    .and_downcast::<gio::FileInfo>()
+                    .and_then(|info| current.child(info.name()).path())
+            })
+            .collect()
+    }
+
+    fn copy_selected(&self, move_files: bool) {
+        let paths = self.selected_paths();
+        if paths.is_empty() {
+            self.show_operation_error("select at least one item");
+        } else {
+            self.operations.set_clipboard(paths, move_files);
+        }
+    }
+
+    fn paste(&self) {
+        let Some((move_files, sources)) = self.operations.clipboard() else {
+            self.show_operation_error("nothing to paste");
+            return;
+        };
+        let Some(destination) = self.current.borrow().path() else {
+            self.show_operation_error("only local destinations are supported");
+            return;
+        };
+        let operation = if move_files {
+            Operation::Move {
+                sources,
+                destination,
+            }
+        } else {
+            Operation::Copy {
+                sources,
+                destination,
+            }
+        };
+        if let Err(error) = self.operations.enqueue(operation) {
+            self.show_operation_error(&error);
+        }
+    }
+
+    fn show_rename(self: &Rc<Self>) {
+        let paths = self.selected_paths();
+        if paths.len() != 1 {
+            self.show_operation_error("select exactly one item to rename");
+            return;
+        }
+        let source = paths[0].clone();
+        let dialog = gtk::Dialog::builder().title("Rename").modal(true).build();
+        if let Some(parent) = self.path_entry.root().and_downcast::<gtk::Window>() {
+            dialog.set_transient_for(Some(&parent));
+        }
+        dialog.add_button("Cancel", gtk::ResponseType::Cancel);
+        dialog.add_button("Rename", gtk::ResponseType::Accept);
+        let entry = gtk::Entry::new();
+        entry.set_activates_default(true);
+        entry.set_text(&source.file_name().unwrap_or_default().to_string_lossy());
+        entry.set_accessible_role(gtk::AccessibleRole::TextBox);
+        dialog.content_area().append(&entry);
+        dialog.set_default_response(gtk::ResponseType::Accept);
+        dialog.connect_response({
+            let explorer = Rc::downgrade(self);
+            move |dialog, response| {
+                if response == gtk::ResponseType::Accept
+                    && let Some(explorer) = explorer.upgrade()
+                {
+                    let operation = Operation::Rename {
+                        source: source.clone(),
+                        new_name: entry.text().as_str().into(),
+                    };
+                    if let Err(error) = explorer.operations.enqueue(operation) {
+                        explorer.show_operation_error(&error);
+                    }
+                }
+                dialog.close();
+            }
+        });
+        dialog.present();
+    }
+
+    fn confirm_trash(self: &Rc<Self>) {
+        let paths = self.selected_paths();
+        if paths.is_empty() {
+            self.show_operation_error("select at least one item to move to Trash");
+            return;
+        }
+        let parent = self.path_entry.root().and_downcast::<gtk::Window>();
+        let dialog = gtk::MessageDialog::new(
+            parent.as_ref(),
+            gtk::DialogFlags::MODAL,
+            gtk::MessageType::Question,
+            gtk::ButtonsType::None,
+            format!("Move {} selected item(s) to Trash?", paths.len()),
+        );
+        dialog.add_button("Cancel", gtk::ResponseType::Cancel);
+        dialog.add_button("Move to Trash", gtk::ResponseType::Accept);
+        dialog.connect_response({
+            let explorer = Rc::downgrade(self);
+            move |dialog, response| {
+                if let Some(operation) =
+                    trash_operation(paths.clone(), response == gtk::ResponseType::Accept)
+                    && let Some(explorer) = explorer.upgrade()
+                    && let Err(error) = explorer.operations.enqueue(operation)
+                {
+                    explorer.show_operation_error(&error);
+                }
+                dialog.close();
+            }
+        });
+        dialog.present();
+    }
+
     fn launch(&self, file: &gio::File) {
         if let Err(error) =
             gio::AppInfo::launch_default_for_uri(&file.uri(), gio::AppLaunchContext::NONE)
         {
             self.show_error(&format!("cannot open {}: {error}", file.parse_name()));
         }
+    }
+
+    fn show_operation_error(&self, error: &str) {
+        let message = format!("File operation error: {error}");
+        glib::g_warning!("kora", "{message}");
+        self.error_label.set_label(&message);
+        self.error_label.set_visible(true);
     }
 
     fn show_error(&self, error: &str) {
@@ -405,6 +621,17 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    #[test]
+    fn cancelled_trash_confirmation_does_not_create_an_operation() {
+        let directory = temp_path("cancel-trash");
+        fs::create_dir(&directory).unwrap();
+        let file = directory.join("file");
+        fs::write(&file, "content").unwrap();
+        assert!(trash_operation(vec![file.clone()], false).is_none());
+        assert_eq!(fs::read_to_string(file).unwrap(), "content");
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

@@ -88,6 +88,8 @@ pub struct OperationQueue {
     listeners: Rc<std::cell::RefCell<Vec<glib::WeakRef<gtk::Label>>>>,
     results: Arc<Mutex<VecDeque<OperationResult>>>,
     holds: Rc<std::cell::RefCell<VecDeque<gio::ApplicationHoldGuard>>>,
+    clipboard: std::cell::RefCell<Option<(bool, Vec<PathBuf>)>>,
+    next_id: std::cell::Cell<u64>,
     app: gtk::Application,
 }
 
@@ -165,6 +167,8 @@ impl OperationQueue {
             listeners,
             results,
             holds,
+            clipboard: std::cell::RefCell::new(None),
+            next_id: std::cell::Cell::new(1),
             app: app.clone(),
         })
     }
@@ -173,9 +177,28 @@ impl OperationQueue {
         let weak = glib::WeakRef::new();
         weak.set(Some(label));
         self.listeners.borrow_mut().push(weak);
+        if let Some(result) = self.results.lock().unwrap().back() {
+            label.set_label(&result.message());
+            label.set_visible(true);
+        }
     }
 
-    pub fn submit(&self, request: Request) -> Result<(), String> {
+    pub fn enqueue(&self, operation: Operation) -> Result<u64, String> {
+        let id = self.next_id.get();
+        self.next_id.set(id.wrapping_add(1));
+        self.submit(Request { id, operation })?;
+        Ok(id)
+    }
+
+    pub fn set_clipboard(&self, paths: Vec<PathBuf>, move_files: bool) {
+        *self.clipboard.borrow_mut() = Some((move_files, paths));
+    }
+
+    pub fn clipboard(&self) -> Option<(bool, Vec<PathBuf>)> {
+        self.clipboard.borrow().clone()
+    }
+
+    fn submit(&self, request: Request) -> Result<(), String> {
         self.holds.borrow_mut().push_back(self.app.hold());
         if self.sender.send(request).is_err() {
             self.holds.borrow_mut().pop_back();
@@ -188,14 +211,6 @@ impl OperationQueue {
             }
         }
         Ok(())
-    }
-
-    pub fn results(&self) -> Vec<OperationResult> {
-        self.results.lock().unwrap().iter().cloned().collect()
-    }
-
-    pub fn is_active(&self) -> bool {
-        !self.holds.borrow().is_empty()
     }
 }
 
@@ -245,12 +260,7 @@ fn execute(request: Request) -> OperationResult {
         }
         Ok(Operation::Trash { paths }) => paths
             .into_iter()
-            .map(|path| {
-                let result = gio::File::for_path(&path)
-                    .trash(gio::Cancellable::NONE)
-                    .map_err(|error| error.to_string());
-                item_result(path, result)
-            })
+            .map(|path| item_result(path.clone(), trash_path(&path)))
             .collect(),
         Err(error) => vec![ItemResult {
             path: PathBuf::new(),
@@ -258,6 +268,18 @@ fn execute(request: Request) -> OperationResult {
         }],
     };
     OperationResult { id, items }
+}
+
+fn trash_path(path: &Path) -> Result<(), String> {
+    trash_with(path, |path| {
+        gio::File::for_path(path)
+            .trash(gio::Cancellable::NONE)
+            .map_err(|error| error.to_string())
+    })
+}
+
+fn trash_with(path: &Path, trash: impl FnOnce(&Path) -> Result<(), String>) -> Result<(), String> {
+    trash(path)
 }
 
 fn item_result(path: PathBuf, result: Result<(), String>) -> ItemResult {
@@ -450,6 +472,17 @@ mod tests {
         ));
         fs::create_dir(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn trash_failure_never_falls_back_to_deletion() {
+        let root = temp_dir("trash-failure");
+        let file = root.join("file");
+        fs::write(&file, "content").unwrap();
+        let result = trash_with(&file, |_| Err("Trash unavailable".into()));
+        assert_eq!(result.unwrap_err(), "Trash unavailable");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "content");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
