@@ -67,7 +67,7 @@ pub fn view(start: PathBuf, home: PathBuf) -> gtk::Box {
 
     let directory = gtk::DirectoryList::new(
         Some(
-            "standard::name,standard::display-name,standard::type,standard::icon,standard::is-hidden",
+            "standard::name,standard::display-name,standard::type,standard::icon,standard::is-hidden,standard::is-symlink",
         ),
         None::<&gio::File>,
     );
@@ -206,6 +206,8 @@ pub fn view(start: PathBuf, home: PathBuf) -> gtk::Box {
                 explorer.navigate(child, true);
             } else if info.is_symlink() && file_type == gio::FileType::Unknown {
                 explorer.show_error("broken symbolic link");
+            } else {
+                explorer.launch(&child);
             }
         }
     });
@@ -301,6 +303,14 @@ impl Explorer {
         self.navigate(target, false);
     }
 
+    fn launch(&self, file: &gio::File) {
+        if let Err(error) =
+            gio::AppInfo::launch_default_for_uri(&file.uri(), gio::AppLaunchContext::NONE)
+        {
+            self.show_error(&format!("cannot open {}: {error}", file.parse_name()));
+        }
+    }
+
     fn show_error(&self, error: &str) {
         let path = self.path_entry.text();
         let message = format!("Folder error: {path}: {error}");
@@ -357,6 +367,16 @@ mod tests {
         File::create(&file).unwrap();
         assert_eq!(validate_start_path(&file).unwrap_err(), "not a directory");
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_uri_preserves_non_utf8_name() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        let path = PathBuf::from(OsString::from_vec(b"/tmp/kora-\xff.txt".to_vec()));
+        let uri = gio::File::for_path(path).uri();
+        assert!(uri.contains("kora-%FF.txt"));
     }
 
     #[cfg(unix)]
