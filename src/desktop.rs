@@ -12,7 +12,7 @@ use x11rb::{
     wrapper::ConnectionExt as _,
 };
 
-use crate::config::Config;
+use crate::config::{Config, Settings, WallpaperMode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
@@ -82,6 +82,67 @@ fn install_panel_input_region(window: &gtk::ApplicationWindow, panel: &impl IsA<
     });
 }
 
+fn make_window_transparent(window: &gtk::ApplicationWindow) {
+    let provider = gtk::CssProvider::new();
+    provider.load_from_data(".kora-window { background-color: transparent; }");
+    gtk::style_context_add_provider_for_display(
+        &gtk::prelude::WidgetExt::display(window),
+        &provider,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+    window.add_css_class("kora-window");
+}
+
+fn build_view(settings: &Settings) -> (gtk::Overlay, gtk::Box) {
+    let root = gtk::Overlay::new();
+    let background = gtk::DrawingArea::new();
+    if settings.wallpaper_mode == WallpaperMode::Replace {
+        let red =
+            u8::from_str_radix(&settings.background_color[1..3], 16).unwrap_or(32) as f64 / 255.0;
+        let green =
+            u8::from_str_radix(&settings.background_color[3..5], 16).unwrap_or(32) as f64 / 255.0;
+        let blue =
+            u8::from_str_radix(&settings.background_color[5..7], 16).unwrap_or(32) as f64 / 255.0;
+        background.set_draw_func(move |_, context, width, height| {
+            context.set_source_rgb(red, green, blue);
+            context.rectangle(0.0, 0.0, width.into(), height.into());
+            let _ = context.fill();
+        });
+    }
+    root.set_child(Some(&background));
+
+    let panel = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .halign(gtk::Align::Start)
+        .valign(gtk::Align::Start)
+        .margin_top(16)
+        .margin_start(16)
+        .build();
+    panel.append(&gtk::Label::new(Some(&settings.path.display().to_string())));
+
+    if settings.wallpaper_mode == WallpaperMode::Replace {
+        if let Some(path) = &settings.wallpaper_image {
+            match gdk::Texture::from_file(&gtk::gio::File::for_path(path)) {
+                Ok(texture) => {
+                    let picture = gtk::Picture::for_paintable(&texture);
+                    picture.set_content_fit(gtk::ContentFit::Cover);
+                    picture.set_can_shrink(true);
+                    picture.set_hexpand(true);
+                    picture.set_vexpand(true);
+                    root.add_overlay(&picture);
+                }
+                Err(error) => {
+                    let message = format!("Wallpaper error: {}: {error}", path.display());
+                    glib::g_warning!("kora", "{message}");
+                    panel.append(&gtk::Label::new(Some(&message)));
+                }
+            }
+        }
+    }
+    root.add_overlay(&panel);
+    (root, panel)
+}
+
 fn validate_wayland_capabilities(supported: bool, version: u32) -> Result<(), String> {
     if !supported {
         return Err("the Wayland compositor does not support layer-shell".into());
@@ -105,6 +166,7 @@ fn create_wayland_view(
         .focusable(true)
         .build();
 
+    make_window_transparent(&window);
     window.init_layer_shell();
     window.set_namespace(Some("kora"));
     window.set_layer(Layer::Bottom);
@@ -115,14 +177,7 @@ fn create_wayland_view(
     window.set_exclusive_zone(-1);
     window.set_keyboard_mode(KeyboardMode::None);
 
-    let panel = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .halign(gtk::Align::Start)
-        .valign(gtk::Align::Start)
-        .margin_top(16)
-        .margin_start(16)
-        .build();
-    panel.append(&gtk::Label::new(Some(&settings.path.display().to_string())));
+    let (content, panel) = build_view(&settings);
     let click = gtk::GestureClick::new();
     click.connect_pressed({
         let window = window.clone();
@@ -132,7 +187,7 @@ fn create_wayland_view(
         }
     });
     panel.add_controller(click);
-    window.set_child(Some(&panel));
+    window.set_child(Some(&content));
     window.set_visible(true);
     install_panel_input_region(&window, &panel);
 
@@ -258,14 +313,9 @@ fn create_x11_view(
         .default_width(geometry.width())
         .default_height(geometry.height())
         .build();
-    let panel = gtk::Box::builder()
-        .halign(gtk::Align::Start)
-        .valign(gtk::Align::Start)
-        .margin_top(16)
-        .margin_start(16)
-        .build();
-    panel.append(&gtk::Label::new(Some(&settings.path.display().to_string())));
-    window.set_child(Some(&panel));
+    make_window_transparent(&window);
+    let (content, panel) = build_view(&settings);
+    window.set_child(Some(&content));
     gtk::prelude::WidgetExt::realize(&window);
 
     let surface = window

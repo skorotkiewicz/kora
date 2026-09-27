@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 gdk4-x11 = "0.10"
-gtk4 = "0.10"
+gtk4 = { version = "0.10", features = ["v4_8"] }
 gtk4-layer-shell = "0.7"
 rustix = { version = "1", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }
