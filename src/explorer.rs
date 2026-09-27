@@ -13,6 +13,45 @@ fn trash_operation(paths: Vec<PathBuf>, confirmed: bool) -> Option<Operation> {
     confirmed.then_some(Operation::Trash { paths })
 }
 
+fn local_drag_paths(files: &[gio::File]) -> Result<Vec<PathBuf>, String> {
+    if files.is_empty() {
+        return Err("the drag contains no files".into());
+    }
+    files
+        .iter()
+        .map(|file| {
+            let path = file
+                .path()
+                .ok_or_else(|| format!("unsupported non-local URI: {}", file.uri()))?;
+            let kind = std::fs::symlink_metadata(&path)
+                .map_err(|error| format!("{}: {error}", path.display()))?
+                .file_type();
+            if kind.is_file() || kind.is_dir() || kind.is_symlink() {
+                Ok(path)
+            } else {
+                Err(format!("unsupported special file: {}", path.display()))
+            }
+        })
+        .collect()
+}
+
+fn drag_provider(paths: &[PathBuf]) -> gtk::gdk::ContentProvider {
+    let files = paths.iter().map(gio::File::for_path).collect::<Vec<_>>();
+    let file_list = gtk::gdk::FileList::from_array(&files);
+    let native = gtk::gdk::ContentProvider::for_value(&file_list.to_value());
+    let uri_list = files
+        .iter()
+        .map(gio::File::uri)
+        .collect::<Vec<_>>()
+        .join("\r\n")
+        + "\r\n";
+    let uri = gtk::gdk::ContentProvider::for_bytes(
+        "text/uri-list",
+        &glib::Bytes::from(uri_list.as_bytes()),
+    );
+    gtk::gdk::ContentProvider::new_union(&[native, uri])
+}
+
 #[cfg(test)]
 use std::{fs, path::Path};
 
@@ -27,6 +66,7 @@ struct Explorer {
     operations: Rc<OperationQueue>,
     path_entry: gtk::Entry,
     error_label: gtk::Label,
+    drop_label: gtk::Label,
     recovery: gtk::Box,
     back_button: gtk::Button,
     forward_button: gtk::Button,
@@ -72,6 +112,13 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> gt
     operation_label.set_wrap(true);
     operation_label.set_visible(false);
     operations.subscribe(&operation_label);
+    let drop_label = gtk::Label::new(Some("Drag status: idle"));
+    drop_label.set_xalign(0.0);
+    let current_drop_zone = gtk::Label::new(Some("Drop files here to current folder"));
+    current_drop_zone.set_xalign(0.0);
+    current_drop_zone.set_margin_top(4);
+    current_drop_zone.set_margin_bottom(4);
+    current_drop_zone.set_accessible_role(gtk::AccessibleRole::Group);
     let recovery = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let retry_button = gtk::Button::with_label("Retry");
     let recovery_home_button = gtk::Button::with_label("Home");
@@ -114,18 +161,84 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> gt
     });
     let sorted = gtk::SortListModel::new(Some(filtered), Some(sorter));
     let selection = gtk::MultiSelection::new(Some(sorted));
+    let explorer_slot = Rc::new(RefCell::new(std::rc::Weak::<Explorer>::new()));
     let factory = gtk::SignalListItemFactory::new();
-    factory.connect_setup(|_, item| {
-        let item = item.downcast_ref::<gtk::ListItem>().unwrap();
-        let tile = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        tile.set_size_request(96, 80);
-        tile.set_accessible_role(gtk::AccessibleRole::ListItem);
-        tile.append(&gtk::Image::new());
-        let label = gtk::Label::new(None);
-        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        label.set_max_width_chars(14);
-        tile.append(&label);
-        item.set_child(Some(&tile));
+    factory.connect_setup({
+        let explorer_slot = explorer_slot.clone();
+        move |_, item| {
+            let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+            let tile = gtk::Box::new(gtk::Orientation::Vertical, 4);
+            tile.set_size_request(96, 80);
+            tile.set_accessible_role(gtk::AccessibleRole::ListItem);
+            tile.append(&gtk::Image::new());
+            let label = gtk::Label::new(None);
+            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            label.set_max_width_chars(14);
+            tile.append(&label);
+            let drop_target = gtk::DropTarget::new(
+                gtk::gdk::FileList::static_type(),
+                gtk::gdk::DragAction::COPY | gtk::gdk::DragAction::MOVE,
+            );
+            drop_target.set_preload(true);
+            drop_target.set_propagation_phase(gtk::PropagationPhase::Capture);
+            drop_target.connect_motion({
+                let item = item.clone();
+                let explorer_slot = explorer_slot.clone();
+                move |target, _, _| {
+                    let Some(explorer) = explorer_slot.borrow().upgrade() else {
+                        return gtk::gdk::DragAction::empty();
+                    };
+                    let Some(destination) = explorer.folder_for_item(&item) else {
+                        return gtk::gdk::DragAction::empty();
+                    };
+                    let action = Explorer::drop_action(target);
+                    explorer.show_drop_action(&destination, action);
+                    action
+                }
+            });
+            drop_target.connect_leave({
+                let explorer_slot = explorer_slot.clone();
+                move |_| {
+                    if let Some(explorer) = explorer_slot.borrow().upgrade() {
+                        explorer.drop_label.set_label("Drag status: idle");
+                    }
+                }
+            });
+            drop_target.connect_drop({
+                let item = item.clone();
+                let explorer_slot = explorer_slot.clone();
+                move |target, value, _, _| {
+                    let Some(explorer) = explorer_slot.borrow().upgrade() else {
+                        return false;
+                    };
+                    let Some(destination) = explorer.folder_for_item(&item) else {
+                        return false;
+                    };
+                    explorer.accept_drop(target, value, destination)
+                }
+            });
+            tile.add_controller(drop_target);
+            let drag_source = gtk::DragSource::new();
+            drag_source.set_propagation_phase(gtk::PropagationPhase::Capture);
+            drag_source.set_actions(gtk::gdk::DragAction::COPY | gtk::gdk::DragAction::MOVE);
+            drag_source.connect_prepare({
+                let explorer_slot = explorer_slot.clone();
+                move |_, _, _| {
+                    let explorer = explorer_slot.borrow().upgrade()?;
+                    let paths = explorer.selected_paths();
+                    if paths.is_empty() {
+                        None
+                    } else {
+                        explorer
+                            .drop_label
+                            .set_label(&format!("Dragging {} item(s)", paths.len()));
+                        Some(drag_provider(&paths))
+                    }
+                }
+            });
+            tile.add_controller(drag_source);
+            item.set_child(Some(&tile));
+        }
     });
     factory.connect_bind(|_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
@@ -154,6 +267,8 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> gt
     panel.append(&toolbar);
     panel.append(&error_label);
     panel.append(&operation_label);
+    panel.append(&drop_label);
+    panel.append(&current_drop_zone);
     panel.append(&recovery);
     panel.append(&scroller);
 
@@ -168,10 +283,54 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> gt
         operations,
         path_entry,
         error_label,
+        drop_label,
         recovery,
         back_button,
         forward_button,
     });
+    *explorer_slot.borrow_mut() = Rc::downgrade(&explorer);
+
+    let current_drop = gtk::DropTarget::new(
+        gtk::gdk::FileList::static_type(),
+        gtk::gdk::DragAction::COPY | gtk::gdk::DragAction::MOVE,
+    );
+    current_drop.set_preload(true);
+    current_drop.connect_motion({
+        let explorer = Rc::downgrade(&explorer);
+        move |target, _, _| {
+            let Some(explorer) = explorer.upgrade() else {
+                return gtk::gdk::DragAction::empty();
+            };
+            let Some(destination) = explorer.current.borrow().path() else {
+                return gtk::gdk::DragAction::empty();
+            };
+            let action = Explorer::drop_action(target);
+            explorer.show_drop_action(&destination, action);
+            action
+        }
+    });
+    current_drop.connect_leave({
+        let explorer = Rc::downgrade(&explorer);
+        move |_| {
+            if let Some(explorer) = explorer.upgrade() {
+                explorer.drop_label.set_label("Drag status: idle");
+            }
+        }
+    });
+    current_drop.connect_drop({
+        let explorer = Rc::downgrade(&explorer);
+        move |target, value, _, _| {
+            let Some(explorer) = explorer.upgrade() else {
+                return false;
+            };
+            let Some(destination) = explorer.current.borrow().path() else {
+                return false;
+            };
+            explorer.accept_drop(target, value, destination)
+        }
+    });
+    current_drop_zone.add_controller(current_drop);
+
     explorer.navigate(gio::File::for_path(start), false);
 
     explorer
@@ -450,6 +609,90 @@ impl Explorer {
         }
     }
 
+    fn folder_for_item(&self, item: &gtk::ListItem) -> Option<PathBuf> {
+        let info = item.item().and_downcast::<gio::FileInfo>()?;
+        let file = self.current.borrow().child(info.name());
+        (file.query_file_type(gio::FileQueryInfoFlags::NONE, gio::Cancellable::NONE)
+            == gio::FileType::Directory)
+            .then(|| file.path())
+            .flatten()
+    }
+
+    fn drop_action(target: &gtk::DropTarget) -> gtk::gdk::DragAction {
+        let Some(drop) = target.current_drop() else {
+            return gtk::gdk::DragAction::empty();
+        };
+        let offered = drop.actions();
+        let internal = drop.drag().is_some();
+        let explicit_move = target
+            .current_event_state()
+            .contains(gtk::gdk::ModifierType::SHIFT_MASK);
+        if internal && explicit_move && offered.contains(gtk::gdk::DragAction::MOVE) {
+            gtk::gdk::DragAction::MOVE
+        } else if offered.contains(gtk::gdk::DragAction::COPY) {
+            gtk::gdk::DragAction::COPY
+        } else if internal && offered.contains(gtk::gdk::DragAction::MOVE) {
+            gtk::gdk::DragAction::MOVE
+        } else {
+            gtk::gdk::DragAction::empty()
+        }
+    }
+
+    fn show_drop_action(&self, destination: &std::path::Path, action: gtk::gdk::DragAction) {
+        if action.is_empty() {
+            self.drop_label
+                .set_label("Drop rejected: no safe file action is available");
+        } else {
+            let verb = if action == gtk::gdk::DragAction::MOVE {
+                "Move"
+            } else {
+                "Copy"
+            };
+            self.drop_label
+                .set_label(&format!("{verb} to {}", destination.display()));
+        }
+    }
+
+    fn accept_drop(
+        &self,
+        target: &gtk::DropTarget,
+        value: &glib::Value,
+        destination: PathBuf,
+    ) -> bool {
+        let Ok(file_list) = value.get::<gtk::gdk::FileList>() else {
+            self.show_operation_error("unsupported drag payload");
+            return false;
+        };
+        let sources = match local_drag_paths(&file_list.files()) {
+            Ok(paths) => paths,
+            Err(error) => {
+                self.show_operation_error(&error);
+                return false;
+            }
+        };
+        let action = Self::drop_action(target);
+        let operation = if action == gtk::gdk::DragAction::MOVE {
+            Operation::Move {
+                sources,
+                destination,
+            }
+        } else if action == gtk::gdk::DragAction::COPY {
+            Operation::Copy {
+                sources,
+                destination,
+            }
+        } else {
+            return false;
+        };
+        self.drop_label.set_label("Drag status: accepted");
+        if let Err(error) = self.operations.enqueue(operation) {
+            self.show_operation_error(&error);
+            false
+        } else {
+            true
+        }
+    }
+
     fn selected_paths(&self) -> Vec<PathBuf> {
         let current = self.current.borrow();
         (0..self.selection.n_items())
@@ -674,6 +917,45 @@ mod tests {
         let file = directory.join("file");
         File::create(&file).unwrap();
         assert_eq!(validate_start_path(&file).unwrap_err(), "not a directory");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn drag_uri_round_trip_preserves_escaped_names() {
+        let directory = temp_path("drag-uri");
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("name #%.txt");
+        fs::write(&path, "content").unwrap();
+        let uri = gio::File::for_path(&path).uri();
+        assert!(uri.contains("name%20%23%25.txt"));
+        assert_eq!(
+            local_drag_paths(&[gio::File::for_uri(&uri)]).unwrap(),
+            vec![path]
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rejects_entire_mixed_or_missing_drag_payload() {
+        let directory = temp_path("drag-invalid");
+        fs::create_dir(&directory).unwrap();
+        let existing = directory.join("existing");
+        fs::write(&existing, "content").unwrap();
+        assert!(
+            local_drag_paths(&[
+                gio::File::for_path(&existing),
+                gio::File::for_uri("https://example.invalid/file"),
+            ])
+            .is_err()
+        );
+        assert!(
+            local_drag_paths(&[
+                gio::File::for_path(&existing),
+                gio::File::for_path(directory.join("missing")),
+            ])
+            .is_err()
+        );
+        assert_eq!(fs::read_to_string(existing).unwrap(), "content");
         fs::remove_dir_all(directory).unwrap();
     }
 
