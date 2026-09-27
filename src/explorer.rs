@@ -68,6 +68,7 @@ struct Explorer {
     error_label: gtk::Label,
     drop_label: gtk::Label,
     recovery: gtk::Box,
+    back_button: gtk::Button,
 }
 
 #[derive(Clone)]
@@ -82,6 +83,22 @@ pub struct View {
 pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> View {
     let root = gtk::Overlay::builder().hexpand(true).vexpand(true).build();
     root.add_css_class("kora-desktop");
+
+    let controls = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .halign(gtk::Align::End)
+        .valign(gtk::Align::End)
+        .margin_end(16)
+        .margin_bottom(16)
+        .build();
+    let back_button = gtk::Button::with_label("Back");
+    back_button.set_tooltip_text(Some("Go back (Alt+Left)"));
+    back_button.set_visible(false);
+    let hidden_toggle = gtk::CheckButton::with_label("Show hidden files");
+    hidden_toggle.set_tooltip_text(Some("Show hidden files (Ctrl+H)"));
+    controls.append(&back_button);
+    controls.append(&hidden_toggle);
 
     let path_entry = gtk::Entry::new();
     path_entry.set_width_request(560);
@@ -133,6 +150,13 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> Vi
                 || !object
                     .downcast_ref::<gio::FileInfo>()
                     .is_some_and(gio::FileInfo::is_hidden)
+        }
+    });
+    hidden_toggle.connect_toggled({
+        let filter = filter.clone();
+        move |toggle| {
+            show_hidden.set(toggle.is_active());
+            filter.changed(gtk::FilterChange::Different);
         }
     });
     let filtered = gtk::FilterListModel::new(Some(directory.clone()), Some(filter.clone()));
@@ -316,6 +340,7 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> Vi
         .build();
     root.set_child(Some(&scroller));
     root.add_overlay(&notifications);
+    root.add_overlay(&controls);
 
     let explorer = Rc::new(Explorer {
         current: RefCell::new(gio::File::for_path(&start)),
@@ -330,6 +355,7 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> Vi
         error_label,
         drop_label,
         recovery: recovery.clone(),
+        back_button: back_button.clone(),
     });
     *explorer_slot.borrow_mut() = Rc::downgrade(&explorer);
 
@@ -445,6 +471,13 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> Vi
 
     explorer.navigate(gio::File::for_path(start), false);
 
+    back_button.connect_clicked(with_explorer(&explorer, {
+        let grid = grid.clone();
+        move |explorer| {
+            explorer.go_back();
+            grid.grab_focus();
+        }
+    }));
     retry_button.connect_clicked(with_explorer(&explorer, |explorer| {
         explorer.navigate(explorer.current.borrow().clone(), false)
     }));
@@ -549,7 +582,7 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> Vi
     let keys = gtk::EventControllerKey::new();
     keys.connect_key_pressed({
         let explorer = Rc::downgrade(&explorer);
-        let filter = filter.clone();
+        let hidden_toggle = hidden_toggle.clone();
         let grid = grid.clone();
         move |_, key, _, modifiers| {
             let Some(explorer) = explorer.upgrade() else {
@@ -583,8 +616,7 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> Vi
                 explorer.path_entry.grab_focus();
                 true
             } else if control && key == gtk::gdk::Key::h {
-                show_hidden.set(!show_hidden.get());
-                filter.changed(gtk::FilterChange::Different);
+                hidden_toggle.set_active(!hidden_toggle.is_active());
                 true
             } else if alt && key == gtk::gdk::Key::Left {
                 explorer.go_back();
@@ -639,7 +671,12 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> Vi
         root,
         grid,
         tiles,
-        input_widgets: vec![path_entry.upcast(), recovery.upcast()],
+        input_widgets: vec![
+            path_entry.upcast(),
+            recovery.upcast(),
+            back_button.upcast(),
+            hidden_toggle.upcast(),
+        ],
         notifications,
     }
 }
@@ -693,6 +730,9 @@ impl Explorer {
                     explorer.directory.set_file(Some(&target));
                     explorer.error_label.set_visible(false);
                     explorer.recovery.set_visible(false);
+                    explorer
+                        .back_button
+                        .set_visible(!explorer.back.borrow().is_empty());
                 }
                 Err(error) => explorer.show_error(&error.to_string()),
             }
@@ -1041,6 +1081,58 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display; does not open a window"]
+    fn desktop_controls_filter_hidden_files_and_go_back() {
+        gtk::init().unwrap();
+        let app = gtk::Application::builder()
+            .application_id("dev.kora.ControlsTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let view = view(root.clone(), root, OperationQueue::new(&app));
+        let model = view.grid.model().unwrap();
+        let back = view.input_widgets[2]
+            .clone()
+            .downcast::<gtk::Button>()
+            .unwrap();
+        let hidden = view.input_widgets[3]
+            .clone()
+            .downcast::<gtk::CheckButton>()
+            .unwrap();
+        let position = |name: &str| {
+            (0..model.n_items()).find(|&index| {
+                model
+                    .item(index)
+                    .and_downcast::<gio::FileInfo>()
+                    .unwrap()
+                    .name()
+                    == Path::new(name)
+            })
+        };
+        let wait = |condition: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !condition() {
+                assert!(std::time::Instant::now() < deadline, "GTK update timed out");
+                glib::MainContext::default().iteration(false);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        wait(&|| position("Cargo.toml").is_some());
+        assert!(!back.is_visible());
+        assert!(position(".gitignore").is_none());
+        hidden.set_active(true);
+        wait(&|| position(".gitignore").is_some());
+        hidden.set_active(false);
+        wait(&|| position(".gitignore").is_none());
+        view.grid
+            .emit_by_name::<()>("activate", &[&position("src").unwrap()]);
+        wait(&|| back.is_visible() && position("desktop.rs").is_some());
+        back.emit_clicked();
+        wait(&|| !back.is_visible() && position("Cargo.toml").is_some());
     }
 
     #[test]
