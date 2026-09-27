@@ -68,61 +68,55 @@ struct Explorer {
     error_label: gtk::Label,
     drop_label: gtk::Label,
     recovery: gtk::Box,
-    back_button: gtk::Button,
-    forward_button: gtk::Button,
 }
 
-pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> gtk::Box {
-    let panel = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .halign(gtk::Align::Start)
-        .valign(gtk::Align::Start)
-        .margin_top(16)
-        .margin_start(16)
-        .spacing(6)
-        .width_request(640)
-        .height_request(480)
-        .build();
-    let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-    let back_button = gtk::Button::with_label("Back");
-    let forward_button = gtk::Button::with_label("Forward");
-    let parent_button = gtk::Button::with_label("Parent");
-    let home_button = gtk::Button::with_label("Home");
+#[derive(Clone)]
+pub struct View {
+    pub root: gtk::Overlay,
+    pub grid: gtk::GridView,
+    pub tiles: gio::ListStore,
+    pub input_widgets: Vec<gtk::Widget>,
+    pub notifications: gtk::Box,
+}
+
+pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> View {
+    let root = gtk::Overlay::builder().hexpand(true).vexpand(true).build();
+    root.add_css_class("kora-desktop");
+
     let path_entry = gtk::Entry::new();
-    path_entry.set_hexpand(true);
+    path_entry.set_width_request(560);
     path_entry.set_accessible_role(gtk::AccessibleRole::TextBox);
-    let hidden_toggle = gtk::CheckButton::with_label("Hidden");
-    for widget in [
-        back_button.clone().upcast::<gtk::Widget>(),
-        forward_button.clone().upcast(),
-        parent_button.clone().upcast(),
-        home_button.clone().upcast(),
-        path_entry.clone().upcast(),
-        hidden_toggle.clone().upcast(),
-    ] {
-        toolbar.append(&widget);
-    }
+    path_entry.set_visible(false);
 
     let error_label = gtk::Label::new(None);
     error_label.set_xalign(0.0);
     error_label.set_wrap(true);
+    error_label.set_visible(false);
     error_label.add_css_class("error");
-    let operation_label = gtk::Label::new(Some("File operations: idle"));
+    let operation_label = gtk::Label::new(None);
     operation_label.set_xalign(0.0);
     operation_label.set_wrap(true);
+    operation_label.set_visible(false);
     operations.subscribe(&operation_label);
-    let drop_label = gtk::Label::new(Some("Drag status: idle"));
+    let drop_label = gtk::Label::new(None);
     drop_label.set_xalign(0.0);
-    let current_drop_zone = gtk::Label::new(Some("Drop files here to current folder"));
-    current_drop_zone.set_xalign(0.0);
-    current_drop_zone.set_margin_top(4);
-    current_drop_zone.set_margin_bottom(4);
-    current_drop_zone.set_accessible_role(gtk::AccessibleRole::Group);
+    drop_label.set_visible(false);
     let recovery = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    recovery.set_visible(false);
     let retry_button = gtk::Button::with_label("Retry");
     let recovery_home_button = gtk::Button::with_label("Home");
     recovery.append(&retry_button);
     recovery.append(&recovery_home_button);
+
+    let notifications = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    notifications.set_halign(gtk::Align::Center);
+    notifications.set_valign(gtk::Align::Start);
+    notifications.set_margin_top(16);
+    notifications.append(&path_entry);
+    notifications.append(&error_label);
+    notifications.append(&operation_label);
+    notifications.append(&drop_label);
+    notifications.append(&recovery);
 
     let directory = gtk::DirectoryList::new(
         Some(
@@ -161,9 +155,11 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> gt
     let sorted = gtk::SortListModel::new(Some(filtered), Some(sorter));
     let selection = gtk::MultiSelection::new(Some(sorted));
     let explorer_slot = Rc::new(RefCell::new(std::rc::Weak::<Explorer>::new()));
+    let tiles = gio::ListStore::new::<gtk::Widget>();
     let factory = gtk::SignalListItemFactory::new();
     factory.connect_setup({
         let explorer_slot = explorer_slot.clone();
+        let tiles = tiles.clone();
         move |_, item| {
             let item = item.downcast_ref::<gtk::ListItem>().unwrap();
             let tile = gtk::Box::new(gtk::Orientation::Vertical, 4);
@@ -199,7 +195,7 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> gt
                 let explorer_slot = explorer_slot.clone();
                 move |_| {
                     if let Some(explorer) = explorer_slot.borrow().upgrade() {
-                        explorer.drop_label.set_label("Drag status: idle");
+                        explorer.drop_label.set_visible(false);
                     }
                 }
             });
@@ -242,6 +238,7 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> gt
                     explorer
                         .drop_label
                         .set_label(&format!("Dragging {} item(s)", paths.len()));
+                    explorer.drop_label.set_visible(true);
                     Some(drag_provider(&paths))
                 }
             });
@@ -255,7 +252,7 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> gt
                     let Some(explorer) = explorer_slot.borrow().upgrade() else {
                         return;
                     };
-                    explorer.drop_label.set_label("Drag status: idle");
+                    explorer.drop_label.set_visible(false);
                     let internal_move = explorer.operations.consume_internal_drag_move(&paths);
                     if !delete_data || internal_move {
                         return;
@@ -269,6 +266,23 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> gt
                 }
             });
             tile.add_controller(drag_source);
+            tile.connect_map({
+                let tiles = tiles.clone();
+                move |tile| {
+                    let tile = tile.clone().upcast::<gtk::Widget>();
+                    if tiles.find(&tile).is_none() {
+                        tiles.append(&tile);
+                    }
+                }
+            });
+            tile.connect_unmap({
+                let tiles = tiles.clone();
+                move |tile| {
+                    if let Some(position) = tiles.find(tile) {
+                        tiles.remove(position);
+                    }
+                }
+            });
             item.set_child(Some(&tile));
         }
     });
@@ -288,21 +302,20 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> gt
     });
     let grid = gtk::GridView::new(Some(selection.clone()), Some(factory));
     grid.set_min_columns(1);
-    grid.set_max_columns(8);
+    grid.set_max_columns(32);
     grid.set_enable_rubberband(true);
     let scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vexpand(true)
+        .hexpand(true)
+        .margin_top(16)
+        .margin_bottom(16)
+        .margin_start(16)
+        .margin_end(16)
         .child(&grid)
         .build();
-
-    panel.append(&toolbar);
-    panel.append(&error_label);
-    panel.append(&operation_label);
-    panel.append(&drop_label);
-    panel.append(&current_drop_zone);
-    panel.append(&recovery);
-    panel.append(&scroller);
+    root.set_child(Some(&scroller));
+    root.add_overlay(&notifications);
 
     let explorer = Rc::new(Explorer {
         current: RefCell::new(gio::File::for_path(&start)),
@@ -313,12 +326,10 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> gt
         directory,
         selection: selection.clone(),
         operations,
-        path_entry,
+        path_entry: path_entry.clone(),
         error_label,
         drop_label,
-        recovery,
-        back_button,
-        forward_button,
+        recovery: recovery.clone(),
     });
     *explorer_slot.borrow_mut() = Rc::downgrade(&explorer);
 
@@ -350,7 +361,7 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> gt
         move |_, _| {
             current_drop_action.set(gtk::gdk::DragAction::empty());
             if let Some(explorer) = explorer.upgrade() {
-                explorer.drop_label.set_label("Drag status: idle");
+                explorer.drop_label.set_visible(false);
             }
         }
     });
@@ -430,24 +441,10 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> gt
             true
         }
     });
-    current_drop_zone.add_controller(current_drop);
+    grid.add_controller(current_drop);
 
     explorer.navigate(gio::File::for_path(start), false);
 
-    explorer
-        .back_button
-        .connect_clicked(with_explorer(&explorer, |explorer| explorer.go_back()));
-    explorer
-        .forward_button
-        .connect_clicked(with_explorer(&explorer, |explorer| explorer.go_forward()));
-    parent_button.connect_clicked(with_explorer(&explorer, |explorer| {
-        if let Some(parent) = explorer.current.borrow().parent() {
-            explorer.navigate(parent, true);
-        }
-    }));
-    home_button.connect_clicked(with_explorer(&explorer, |explorer| {
-        explorer.navigate(explorer.home.clone(), true)
-    }));
     retry_button.connect_clicked(with_explorer(&explorer, |explorer| {
         explorer.navigate(explorer.current.borrow().clone(), false)
     }));
@@ -458,13 +455,10 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> gt
         let explorer = Rc::downgrade(&explorer);
         move |entry| {
             if let Some(explorer) = explorer.upgrade() {
+                entry.set_visible(false);
                 explorer.navigate(gio::File::for_path(entry.text()), true);
             }
         }
-    });
-    hidden_toggle.connect_toggled(move |toggle| {
-        show_hidden.set(toggle.is_active());
-        filter.changed(gtk::FilterChange::Different);
     });
     grid.connect_activate({
         let explorer = Rc::downgrade(&explorer);
@@ -555,12 +549,21 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> gt
     let keys = gtk::EventControllerKey::new();
     keys.connect_key_pressed({
         let explorer = Rc::downgrade(&explorer);
+        let filter = filter.clone();
+        let grid = grid.clone();
         move |_, key, _, modifiers| {
             let Some(explorer) = explorer.upgrade() else {
                 return glib::Propagation::Proceed;
             };
             let control = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK);
-            let handled = if key == gtk::gdk::Key::F2 {
+            let alt = modifiers.contains(gtk::gdk::ModifierType::ALT_MASK);
+            let handled = if key == gtk::gdk::Key::Escape
+                && gtk::prelude::WidgetExt::is_visible(&explorer.path_entry)
+            {
+                explorer.path_entry.set_visible(false);
+                grid.grab_focus();
+                true
+            } else if key == gtk::gdk::Key::F2 {
                 explorer.show_rename();
                 true
             } else if key == gtk::gdk::Key::Delete {
@@ -576,7 +579,26 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> gt
                 explorer.paste();
                 true
             } else if control && key == gtk::gdk::Key::l {
+                explorer.path_entry.set_visible(true);
                 explorer.path_entry.grab_focus();
+                true
+            } else if control && key == gtk::gdk::Key::h {
+                show_hidden.set(!show_hidden.get());
+                filter.changed(gtk::FilterChange::Different);
+                true
+            } else if alt && key == gtk::gdk::Key::Left {
+                explorer.go_back();
+                true
+            } else if alt && key == gtk::gdk::Key::Right {
+                explorer.go_forward();
+                true
+            } else if alt && key == gtk::gdk::Key::Up {
+                if let Some(parent) = explorer.current.borrow().parent() {
+                    explorer.navigate(parent, true);
+                }
+                true
+            } else if alt && key == gtk::gdk::Key::Home {
+                explorer.navigate(explorer.home.clone(), true);
                 true
             } else if control && key == gtk::gdk::Key::q {
                 explorer.confirm_quit();
@@ -587,7 +609,7 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> gt
             handled.into()
         }
     });
-    panel.add_controller(keys);
+    root.add_controller(keys);
     let context_click = gtk::GestureClick::new();
     context_click.set_button(3);
     context_click.connect_pressed({
@@ -606,14 +628,20 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> gt
             }
         }
     });
-    panel.connect_destroy({
+    root.connect_destroy({
         let explorer = explorer.clone();
         move |_| {
             let _ = &explorer;
         }
     });
 
-    panel
+    View {
+        root,
+        grid,
+        tiles,
+        input_widgets: vec![path_entry.upcast(), recovery.upcast()],
+        notifications,
+    }
 }
 
 fn with_explorer<F>(explorer: &Rc<Explorer>, action: F) -> impl Fn(&gtk::Button) + 'static
@@ -665,7 +693,6 @@ impl Explorer {
                     explorer.directory.set_file(Some(&target));
                     explorer.error_label.set_visible(false);
                     explorer.recovery.set_visible(false);
-                    explorer.update_history_buttons();
                 }
                 Err(error) => explorer.show_error(&error.to_string()),
             }
@@ -759,6 +786,7 @@ impl Explorer {
     }
 
     fn show_drop_action(&self, destination: &std::path::Path, action: gtk::gdk::DragAction) {
+        self.drop_label.set_visible(true);
         if action.is_empty() {
             self.drop_label
                 .set_label("Drop rejected: no safe file action is available");
@@ -983,13 +1011,6 @@ impl Explorer {
         self.error_label.set_label(&message);
         self.error_label.set_visible(true);
         self.recovery.set_visible(true);
-    }
-
-    fn update_history_buttons(&self) {
-        self.back_button
-            .set_sensitive(!self.back.borrow().is_empty());
-        self.forward_button
-            .set_sensitive(!self.forward.borrow().is_empty());
     }
 }
 

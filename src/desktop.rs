@@ -52,38 +52,107 @@ fn monitor_key(monitor: &gdk::Monitor, index: u32) -> String {
     )
 }
 
-fn set_panel_input_region(window: &gtk::ApplicationWindow, panel: &gtk::Widget) {
+fn add_widget_to_input_region(
+    region: &gtk::cairo::Region,
+    window: &gtk::ApplicationWindow,
+    widget: &gtk::Widget,
+) {
+    if !widget.is_mapped() {
+        return;
+    }
+    let Some(bounds) = widget.compute_bounds(window) else {
+        return;
+    };
+    let x = bounds.x().floor() as i32;
+    let y = bounds.y().floor() as i32;
+    let width = bounds.width().ceil() as i32;
+    let height = bounds.height().ceil() as i32;
+    if width > 0 && height > 0 {
+        let _ = region.union_rectangle(&gtk::cairo::RectangleInt::new(x, y, width, height));
+    }
+}
+
+fn set_desktop_input_region(window: &gtk::ApplicationWindow, view: &explorer::View) {
     let Some(surface) = window.surface() else {
         return;
     };
-    let allocation = panel.allocation();
-    let rectangle = gtk::cairo::RectangleInt::new(
-        allocation.x(),
-        allocation.y(),
-        allocation.width(),
-        allocation.height(),
-    );
-    surface.set_input_region(&gtk::cairo::Region::create_rectangle(&rectangle));
+    let region = gtk::cairo::Region::create();
+    for index in 0..view.tiles.n_items() {
+        if let Some(tile) = view.tiles.item(index).and_downcast::<gtk::Widget>() {
+            add_widget_to_input_region(&region, window, &tile);
+        }
+    }
+    for widget in &view.input_widgets {
+        add_widget_to_input_region(&region, window, widget);
+    }
+    surface.set_input_region(&region);
 }
 
-fn install_panel_input_region(window: &gtk::ApplicationWindow, panel: &impl IsA<gtk::Widget>) {
-    let panel = panel.clone().upcast::<gtk::Widget>();
-    for property in ["width", "height"] {
-        panel.connect_notify_local(Some(property), {
+fn install_desktop_input_region(window: &gtk::ApplicationWindow, view: &explorer::View) {
+    let pending = Rc::new(std::cell::Cell::new(false));
+    let update = {
+        let pending = pending.clone();
+        move |window: &gtk::ApplicationWindow, view: &explorer::View| {
+            if pending.replace(true) {
+                return;
+            }
             let window = window.clone();
-            let panel = panel.clone();
-            move |_, _| set_panel_input_region(&window, &panel)
+            let view = view.clone();
+            let pending = pending.clone();
+            view.grid.add_tick_callback(move |_, _| {
+                glib::idle_add_local_once({
+                    let window = window.clone();
+                    let view = view.clone();
+                    let pending = pending.clone();
+                    move || {
+                        set_desktop_input_region(&window, &view);
+                        pending.set(false);
+                    }
+                });
+                glib::ControlFlow::Break
+            });
+        }
+    };
+    view.tiles.connect_items_changed({
+        let window = window.clone();
+        let view = view.clone();
+        move |_, _, _, _| update(&window, &view)
+    });
+    if let Some(model) = view.grid.model() {
+        model.connect_items_changed({
+            let window = window.clone();
+            let view = view.clone();
+            move |_, _, _, _| update(&window, &view)
+        });
+    }
+    for property in ["width", "height"] {
+        view.grid.connect_notify_local(Some(property), {
+            let window = window.clone();
+            let view = view.clone();
+            move |_, _| update(&window, &view)
+        });
+    }
+    if let Some(scroller) = view.grid.ancestor(gtk::ScrolledWindow::static_type()) {
+        let scroller = scroller.downcast::<gtk::ScrolledWindow>().unwrap();
+        scroller.vadjustment().connect_value_changed({
+            let window = window.clone();
+            let view = view.clone();
+            move |_| update(&window, &view)
+        });
+    }
+    for widget in &view.input_widgets {
+        widget.connect_notify_local(Some("visible"), {
+            let window = window.clone();
+            let view = view.clone();
+            move |_, _| update(&window, &view)
         });
     }
     window.connect_notify_local(Some("scale-factor"), {
         let window = window.clone();
-        let panel = panel.clone();
-        move |_, _| set_panel_input_region(&window, &panel)
+        let view = view.clone();
+        move |_, _| update(&window, &view)
     });
-    glib::idle_add_local_once({
-        let window = window.clone();
-        move || set_panel_input_region(&window, &panel)
-    });
+    update(window, view);
 }
 
 fn install_safe_close(window: &gtk::ApplicationWindow, operations: &Rc<OperationQueue>) {
@@ -107,7 +176,10 @@ fn install_safe_close(window: &gtk::ApplicationWindow, operations: &Rc<Operation
 
 fn make_window_transparent(window: &gtk::ApplicationWindow) {
     let provider = gtk::CssProvider::new();
-    provider.load_from_data(".kora-window { background-color: transparent; }");
+    provider.load_from_data(
+        ".kora-window, .kora-desktop, .kora-desktop scrolledwindow, \
+         .kora-desktop viewport, .kora-desktop gridview { background-color: transparent; }",
+    );
     gtk::style_context_add_provider_for_display(
         &gtk::prelude::WidgetExt::display(window),
         &provider,
@@ -120,7 +192,7 @@ fn build_view(
     settings: &Settings,
     home: &std::path::Path,
     operations: Rc<OperationQueue>,
-) -> (gtk::Overlay, gtk::Box) {
+) -> (gtk::Overlay, explorer::View) {
     let root = gtk::Overlay::new();
     let background = gtk::DrawingArea::new();
     if settings.wallpaper_mode == WallpaperMode::Replace {
@@ -138,7 +210,7 @@ fn build_view(
     }
     root.set_child(Some(&background));
 
-    let panel = explorer::view(settings.path.clone(), home.to_path_buf(), operations);
+    let view = explorer::view(settings.path.clone(), home.to_path_buf(), operations);
 
     if settings.wallpaper_mode == WallpaperMode::Replace {
         if let Some(path) = &settings.wallpaper_image {
@@ -154,13 +226,13 @@ fn build_view(
                 Err(error) => {
                     let message = format!("Wallpaper error: {}: {error}", path.display());
                     glib::g_warning!("kora", "{message}");
-                    panel.append(&gtk::Label::new(Some(&message)));
+                    view.notifications.append(&gtk::Label::new(Some(&message)));
                 }
             }
         }
     }
-    root.add_overlay(&panel);
-    (root, panel)
+    root.add_overlay(&view.root);
+    (root, view)
 }
 
 fn validate_wayland_capabilities(supported: bool, version: u32) -> Result<(), String> {
@@ -196,22 +268,13 @@ fn create_wayland_view(
         window.set_anchor(edge, true);
     }
     window.set_exclusive_zone(-1);
-    window.set_keyboard_mode(KeyboardMode::None);
+    window.set_keyboard_mode(KeyboardMode::OnDemand);
 
     install_safe_close(&window, &operations);
-    let (content, panel) = build_view(&settings, config.home(), operations);
-    let click = gtk::GestureClick::new();
-    click.connect_pressed({
-        let window = window.clone();
-        move |_, _, _, _| {
-            window.set_keyboard_mode(KeyboardMode::OnDemand);
-            window.present();
-        }
-    });
-    panel.add_controller(click);
+    let (content, view) = build_view(&settings, config.home(), operations);
     window.set_child(Some(&content));
     window.set_visible(true);
-    install_panel_input_region(&window, &panel);
+    install_desktop_input_region(&window, &view);
 
     Ok(window)
 }
@@ -345,7 +408,7 @@ fn create_x11_view(
         .build();
     make_window_transparent(&window);
     install_safe_close(&window, &operations);
-    let (content, panel) = build_view(&settings, config.home(), operations);
+    let (content, view) = build_view(&settings, config.home(), operations);
     window.set_child(Some(&content));
     gtk::prelude::WidgetExt::realize(&window);
 
@@ -354,15 +417,19 @@ fn create_x11_view(
         .and_downcast::<gdk4_x11::X11Surface>()
         .ok_or("GTK did not create an X11 surface")?;
     let xid = u32::try_from(surface.xid()).map_err(|_| "invalid X11 window id")?;
-    let click = gtk::GestureClick::new();
-    click.connect_pressed(move |_, _, _, _| {
-        let Ok((connection, _)) = x11rb::connect(None) else {
-            return;
-        };
-        let _ = connection.set_input_focus(InputFocus::PARENT, xid, x11rb::CURRENT_TIME);
-        let _ = connection.flush();
+    let focus = gtk::EventControllerLegacy::builder()
+        .propagation_phase(gtk::PropagationPhase::Capture)
+        .build();
+    focus.connect_event(move |_, event| {
+        if event.event_type() == gdk::EventType::ButtonPress {
+            if let Ok((connection, _)) = x11rb::connect(None) {
+                let _ = connection.set_input_focus(InputFocus::PARENT, xid, x11rb::CURRENT_TIME);
+                let _ = connection.flush();
+            }
+        }
+        glib::Propagation::Proceed
     });
-    panel.add_controller(click);
+    view.root.add_controller(focus);
     let window_type = atom(&connection, "_NET_WM_WINDOW_TYPE")?;
     let desktop_type = atom(&connection, "_NET_WM_WINDOW_TYPE_DESKTOP")?;
     let window_state = atom(&connection, "_NET_WM_STATE")?;
@@ -416,7 +483,7 @@ fn create_x11_view(
         .map_err(|error| error.to_string())?;
     connection.flush().map_err(|error| error.to_string())?;
     window.set_visible(true);
-    install_panel_input_region(&window, &panel);
+    install_desktop_input_region(&window, &view);
     monitor.connect_notify_local(Some("geometry"), move |monitor, _| {
         let Ok((connection, _)) = x11rb::connect(None) else {
             return;
