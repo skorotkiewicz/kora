@@ -1,5 +1,6 @@
 mod config;
 mod desktop;
+mod explorer;
 
 use std::{cell::Cell, process::ExitCode, rc::Rc};
 

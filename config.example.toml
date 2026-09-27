@@ -1,0 +1,12 @@
+[defaults]
+path = "~/Desktop"
+wallpaper_mode = "transparent"
+background_color = "#202020"
+
+[monitors."DP-1"]
+path = "~/Projects"
+wallpaper_mode = "replace"
+wallpaper_image = "~/Pictures/wallpaper.jpg"
+
+[monitors."HDMI-A-1"]
+path = "~/Downloads"

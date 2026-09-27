@@ -12,7 +12,10 @@ use x11rb::{
     wrapper::ConnectionExt as _,
 };
 
-use crate::config::{Config, Settings, WallpaperMode};
+use crate::{
+    config::{Config, Settings, WallpaperMode},
+    explorer,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
@@ -93,7 +96,7 @@ fn make_window_transparent(window: &gtk::ApplicationWindow) {
     window.add_css_class("kora-window");
 }
 
-fn build_view(settings: &Settings) -> (gtk::Overlay, gtk::Box) {
+fn build_view(settings: &Settings, home: &std::path::Path) -> (gtk::Overlay, gtk::Box) {
     let root = gtk::Overlay::new();
     let background = gtk::DrawingArea::new();
     if settings.wallpaper_mode == WallpaperMode::Replace {
@@ -111,14 +114,7 @@ fn build_view(settings: &Settings) -> (gtk::Overlay, gtk::Box) {
     }
     root.set_child(Some(&background));
 
-    let panel = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .halign(gtk::Align::Start)
-        .valign(gtk::Align::Start)
-        .margin_top(16)
-        .margin_start(16)
-        .build();
-    panel.append(&gtk::Label::new(Some(&settings.path.display().to_string())));
+    let panel = explorer::start_panel(settings.path.clone(), home.to_path_buf());
 
     if settings.wallpaper_mode == WallpaperMode::Replace {
         if let Some(path) = &settings.wallpaper_image {
@@ -177,7 +173,7 @@ fn create_wayland_view(
     window.set_exclusive_zone(-1);
     window.set_keyboard_mode(KeyboardMode::None);
 
-    let (content, panel) = build_view(&settings);
+    let (content, panel) = build_view(&settings, config.home());
     let click = gtk::GestureClick::new();
     click.connect_pressed({
         let window = window.clone();
@@ -314,7 +310,7 @@ fn create_x11_view(
         .default_height(geometry.height())
         .build();
     make_window_transparent(&window);
-    let (content, panel) = build_view(&settings);
+    let (content, panel) = build_view(&settings, config.home());
     window.set_child(Some(&content));
     gtk::prelude::WidgetExt::realize(&window);
 

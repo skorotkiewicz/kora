@@ -20,6 +20,7 @@ pub struct Settings {
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    home: PathBuf,
     defaults: Settings,
     monitors: HashMap<String, PartialSettings>,
 }
@@ -51,6 +52,10 @@ struct RawSettings {
 }
 
 impl Config {
+    pub fn home(&self) -> &std::path::Path {
+        &self.home
+    }
+
     pub fn effective(&self, connector: Option<&str>) -> Settings {
         let mut settings = self.defaults.clone();
         let Some(overrides) = connector.and_then(|name| self.monitors.get(name)) else {
@@ -126,6 +131,7 @@ fn load_from(
 
 fn default_config(home: &std::path::Path) -> Config {
     Config {
+        home: home.to_path_buf(),
         defaults: Settings {
             path: home.to_path_buf(),
             wallpaper_mode: WallpaperMode::Transparent,
@@ -298,6 +304,17 @@ mod tests {
             settings.wallpaper_image,
             Some(home.join("config/images/$HOME;still-literal.png"))
         );
+    }
+
+    #[test]
+    fn example_config_parses() {
+        let home = temp_dir("example");
+        parse(
+            include_str!("../config.example.toml"),
+            &home.join("config.toml"),
+            &home,
+        )
+        .unwrap();
     }
 
     #[test]
