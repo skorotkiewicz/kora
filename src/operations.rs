@@ -1,0 +1,632 @@
+use std::{
+    collections::{HashSet, VecDeque},
+    ffi::OsString,
+    fs::{self, OpenOptions},
+    io::{Read, Write},
+    os::{
+        fd::AsRawFd,
+        unix::{fs::MetadataExt, net::UnixStream},
+    },
+    path::{Path, PathBuf},
+    rc::Rc,
+    sync::{Arc, Mutex, mpsc},
+    thread,
+};
+
+use gtk::{gio, glib, prelude::*};
+use gtk4 as gtk;
+use rustix::fs::{CWD, RenameFlags, renameat_with};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Operation {
+    Copy {
+        sources: Vec<PathBuf>,
+        destination: PathBuf,
+    },
+    Move {
+        sources: Vec<PathBuf>,
+        destination: PathBuf,
+    },
+    Rename {
+        source: PathBuf,
+        new_name: OsString,
+    },
+    Trash {
+        paths: Vec<PathBuf>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct Request {
+    pub id: u64,
+    pub operation: Operation,
+}
+
+#[derive(Debug, Clone)]
+pub struct ItemResult {
+    pub path: PathBuf,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OperationResult {
+    pub id: u64,
+    pub items: Vec<ItemResult>,
+}
+
+impl OperationResult {
+    pub fn message(&self) -> String {
+        let failed = self
+            .items
+            .iter()
+            .filter(|item| item.error.is_some())
+            .count();
+        if failed == 0 {
+            format!("Operation {} completed", self.id)
+        } else {
+            let details = self
+                .items
+                .iter()
+                .filter_map(|item| {
+                    item.error
+                        .as_ref()
+                        .map(|error| format!("{}: {error}", item.path.display()))
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!(
+                "Operation {} completed with {failed} of {} items failed: {details}",
+                self.id,
+                self.items.len()
+            )
+        }
+    }
+}
+
+pub struct OperationQueue {
+    sender: mpsc::Sender<Request>,
+    listeners: Rc<std::cell::RefCell<Vec<glib::WeakRef<gtk::Label>>>>,
+    results: Arc<Mutex<VecDeque<OperationResult>>>,
+    holds: Rc<std::cell::RefCell<VecDeque<gio::ApplicationHoldGuard>>>,
+    app: gtk::Application,
+}
+
+impl OperationQueue {
+    pub fn new(app: &gtk::Application) -> Rc<Self> {
+        let (sender, receiver) = mpsc::channel::<Request>();
+        let (mut reader, mut writer) = UnixStream::pair().expect("create operation event pipe");
+        reader
+            .set_nonblocking(true)
+            .expect("make operation event pipe nonblocking");
+        let results = Arc::new(Mutex::new(VecDeque::new()));
+        let worker_results = results.clone();
+        thread::Builder::new()
+            .name("kora-files".into())
+            .spawn(move || {
+                // ponytail: one worker serializes mutations; add per-device workers only if measured throughput requires it.
+                let mut seen = HashSet::new();
+                while let Ok(request) = receiver.recv() {
+                    let result = execute_once(&mut seen, request);
+                    if seen.len() > 1024 {
+                        seen.clear();
+                        seen.insert(result.id);
+                    }
+                    let mut stored = worker_results.lock().unwrap();
+                    stored.push_back(result);
+                    while stored.len() > 100 {
+                        stored.pop_front();
+                    }
+                    drop(stored);
+                    let _ = writer.write_all(&[1]);
+                }
+            })
+            .expect("start filesystem worker");
+
+        let listeners = Rc::new(std::cell::RefCell::new(
+            Vec::<glib::WeakRef<gtk::Label>>::new(),
+        ));
+        let holds = Rc::new(std::cell::RefCell::new(
+            VecDeque::<gio::ApplicationHoldGuard>::new(),
+        ));
+        let source_results = results.clone();
+        let source_listeners = listeners.clone();
+        let source_holds = holds.clone();
+        glib::source::unix_fd_add_local(reader.as_raw_fd(), glib::IOCondition::IN, move |_, _| {
+            let mut bytes = [0; 64];
+            let completed = match reader.read(&mut bytes) {
+                Ok(count) => count,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => 0,
+                Err(_) => return glib::ControlFlow::Break,
+            };
+            let message = source_results
+                .lock()
+                .unwrap()
+                .back()
+                .map(OperationResult::message);
+            source_listeners.borrow_mut().retain(|weak| {
+                if let Some(label) = weak.upgrade() {
+                    if let Some(message) = &message {
+                        label.set_label(message);
+                        label.set_visible(true);
+                    }
+                    true
+                } else {
+                    false
+                }
+            });
+            for _ in 0..completed {
+                source_holds.borrow_mut().pop_front();
+            }
+            glib::ControlFlow::Continue
+        });
+
+        Rc::new(Self {
+            sender,
+            listeners,
+            results,
+            holds,
+            app: app.clone(),
+        })
+    }
+
+    pub fn subscribe(&self, label: &gtk::Label) {
+        let weak = glib::WeakRef::new();
+        weak.set(Some(label));
+        self.listeners.borrow_mut().push(weak);
+    }
+
+    pub fn submit(&self, request: Request) -> Result<(), String> {
+        self.holds.borrow_mut().push_back(self.app.hold());
+        if self.sender.send(request).is_err() {
+            self.holds.borrow_mut().pop_back();
+            return Err("filesystem worker stopped".into());
+        }
+        for weak in self.listeners.borrow().iter() {
+            if let Some(label) = weak.upgrade() {
+                label.set_label("File operation in progress");
+                label.set_visible(true);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn results(&self) -> Vec<OperationResult> {
+        self.results.lock().unwrap().iter().cloned().collect()
+    }
+
+    pub fn is_active(&self) -> bool {
+        !self.holds.borrow().is_empty()
+    }
+}
+
+fn execute_once(seen: &mut HashSet<u64>, request: Request) -> OperationResult {
+    if seen.insert(request.id) {
+        execute(request)
+    } else {
+        OperationResult {
+            id: request.id,
+            items: vec![ItemResult {
+                path: PathBuf::new(),
+                error: Some("duplicate operation request ignored".into()),
+            }],
+        }
+    }
+}
+
+fn execute(request: Request) -> OperationResult {
+    let id = request.id;
+    let items = match validate(request.operation) {
+        Ok(Operation::Copy {
+            sources,
+            destination,
+        }) => sources
+            .into_iter()
+            .map(|source| {
+                let target = destination.join(source.file_name().unwrap_or_default());
+                item_result(source.clone(), copy_entry(&source, &target))
+            })
+            .collect(),
+        Ok(Operation::Move {
+            sources,
+            destination,
+        }) => sources
+            .into_iter()
+            .map(|source| {
+                let target = destination.join(source.file_name().unwrap_or_default());
+                item_result(source.clone(), move_entry(&source, &target))
+            })
+            .collect(),
+        Ok(Operation::Rename { source, new_name }) => {
+            let target = source.with_file_name(new_name);
+            vec![item_result(
+                source.clone(),
+                rename_no_replace(&source, &target),
+            )]
+        }
+        Ok(Operation::Trash { paths }) => paths
+            .into_iter()
+            .map(|path| {
+                let result = gio::File::for_path(&path)
+                    .trash(gio::Cancellable::NONE)
+                    .map_err(|error| error.to_string());
+                item_result(path, result)
+            })
+            .collect(),
+        Err(error) => vec![ItemResult {
+            path: PathBuf::new(),
+            error: Some(error),
+        }],
+    };
+    OperationResult { id, items }
+}
+
+fn item_result(path: PathBuf, result: Result<(), String>) -> ItemResult {
+    ItemResult {
+        path,
+        error: result.err(),
+    }
+}
+
+fn validate(operation: Operation) -> Result<Operation, String> {
+    match operation {
+        Operation::Copy {
+            sources,
+            destination,
+        } => Ok(Operation::Copy {
+            sources: validate_sources(sources, Some(&destination))?,
+            destination: validate_destination(destination)?,
+        }),
+        Operation::Move {
+            sources,
+            destination,
+        } => Ok(Operation::Move {
+            sources: validate_sources(sources, Some(&destination))?,
+            destination: validate_destination(destination)?,
+        }),
+        Operation::Rename { source, new_name } => {
+            validate_source(&source)?;
+            let name_path = Path::new(&new_name);
+            if new_name.is_empty()
+                || new_name == "."
+                || new_name == ".."
+                || name_path.components().count() != 1
+            {
+                return Err("invalid destination name".into());
+            }
+            Ok(Operation::Rename { source, new_name })
+        }
+        Operation::Trash { paths } => Ok(Operation::Trash {
+            paths: validate_sources(paths, None)?,
+        }),
+    }
+}
+
+fn validate_destination(destination: PathBuf) -> Result<PathBuf, String> {
+    let metadata = fs::metadata(&destination).map_err(|error| error.to_string())?;
+    if !metadata.is_dir() {
+        return Err(format!("{} is not a directory", destination.display()));
+    }
+    Ok(destination)
+}
+
+fn validate_sources(
+    mut sources: Vec<PathBuf>,
+    destination: Option<&Path>,
+) -> Result<Vec<PathBuf>, String> {
+    if sources.is_empty() {
+        return Err("no source items selected".into());
+    }
+    sources.sort_by_key(|path| path.components().count());
+    sources.dedup();
+    let mut normalized = Vec::<PathBuf>::new();
+    for source in sources {
+        validate_source(&source)?;
+        if normalized.iter().any(|parent| source.starts_with(parent)) {
+            continue;
+        }
+        if let Some(destination) = destination {
+            let source_resolved = fs::canonicalize(&source).map_err(|error| error.to_string())?;
+            let destination_resolved =
+                fs::canonicalize(destination).map_err(|error| error.to_string())?;
+            if destination_resolved == source_resolved
+                || destination_resolved.starts_with(&source_resolved)
+            {
+                return Err(format!(
+                    "cannot transfer {} into itself or its descendant",
+                    source.display()
+                ));
+            }
+        }
+        normalized.push(source);
+    }
+    Ok(normalized)
+}
+
+fn validate_source(path: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    let kind = metadata.file_type();
+    if kind.is_file() || kind.is_dir() || kind.is_symlink() {
+        Ok(())
+    } else {
+        Err(format!("unsupported special file: {}", path.display()))
+    }
+}
+
+fn copy_entry(source: &Path, destination: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(source).map_err(|error| error.to_string())?;
+    let kind = metadata.file_type();
+    if kind.is_symlink() {
+        let target = fs::read_link(source).map_err(|error| error.to_string())?;
+        std::os::unix::fs::symlink(target, destination).map_err(|error| error.to_string())
+    } else if kind.is_file() {
+        let mut input = fs::File::open(source).map_err(|error| error.to_string())?;
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)
+            .map_err(|error| error.to_string())?;
+        std::io::copy(&mut input, &mut output).map_err(|error| error.to_string())?;
+        output.sync_all().map_err(|error| error.to_string())
+    } else if kind.is_dir() {
+        fs::create_dir(destination).map_err(|error| error.to_string())?;
+        for entry in fs::read_dir(source).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            copy_entry(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        Err(format!("unsupported special file: {}", source.display()))
+    }
+}
+
+fn rename_no_replace(source: &Path, destination: &Path) -> Result<(), String> {
+    renameat_with(CWD, source, CWD, destination, RenameFlags::NOREPLACE)
+        .map_err(|error| error.to_string())
+}
+
+fn move_entry(source: &Path, destination: &Path) -> Result<(), String> {
+    match renameat_with(CWD, source, CWD, destination, RenameFlags::NOREPLACE) {
+        Ok(()) => Ok(()),
+        Err(rustix::io::Errno::XDEV) => cross_filesystem_move(source, destination, || {}),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Fingerprint {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+}
+
+fn fingerprint(path: &Path) -> Result<Fingerprint, String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    Ok(Fingerprint {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        size: metadata.size(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+    })
+}
+
+fn cross_filesystem_move(
+    source: &Path,
+    destination: &Path,
+    after_copy: impl FnOnce(),
+) -> Result<(), String> {
+    let before = fingerprint(source)?;
+    copy_entry(source, destination)?;
+    after_copy();
+    if fingerprint(source)? != before {
+        return Err(format!(
+            "source changed during move; retained source and destination at {}",
+            destination.display()
+        ));
+    }
+    let metadata = fs::symlink_metadata(source).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_dir() {
+        fs::remove_dir_all(source).map_err(|error| error.to_string())
+    } else {
+        fs::remove_file(source).map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "kora-operations-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn normalizes_nested_sources_and_rejects_descendant_destination() {
+        let root = temp_dir("validation");
+        let source = root.join("source");
+        let child = source.join("child");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&child).unwrap();
+        let normalized = validate_sources(vec![child.clone(), source.clone()], None).unwrap();
+        assert_eq!(normalized, vec![source.clone()]);
+        assert!(validate_sources(vec![source], Some(&child)).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn copies_tree_without_following_links_and_never_overwrites() {
+        let root = temp_dir("copy");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("file"), "content").unwrap();
+        std::os::unix::fs::symlink("file", source.join("link")).unwrap();
+        copy_entry(&source, &destination).unwrap();
+        assert_eq!(
+            fs::read_to_string(destination.join("file")).unwrap(),
+            "content"
+        );
+        assert_eq!(
+            fs::read_link(destination.join("link")).unwrap(),
+            PathBuf::from("file")
+        );
+        assert!(copy_entry(&source, &destination).is_err());
+        assert_eq!(fs::read_to_string(source.join("file")).unwrap(), "content");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn no_replace_rename_preserves_both_entries_on_collision() {
+        let root = temp_dir("rename");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::write(&source, "source").unwrap();
+        fs::write(&destination, "destination").unwrap();
+        assert!(rename_no_replace(&source, &destination).is_err());
+        assert_eq!(fs::read_to_string(source).unwrap(), "source");
+        assert_eq!(fs::read_to_string(destination).unwrap(), "destination");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn duplicate_request_id_is_not_executed_twice() {
+        let root = temp_dir("duplicate");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::create_dir(&destination).unwrap();
+        fs::write(&source, "content").unwrap();
+        let request = Request {
+            id: 7,
+            operation: Operation::Copy {
+                sources: vec![source],
+                destination: destination.clone(),
+            },
+        };
+        let mut seen = HashSet::new();
+        assert!(
+            execute_once(&mut seen, request.clone()).items[0]
+                .error
+                .is_none()
+        );
+        assert_eq!(
+            execute_once(&mut seen, request).items[0].error.as_deref(),
+            Some("duplicate operation request ignored")
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("source")).unwrap(),
+            "content"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_special_files_and_symlinked_descendant_targets() {
+        use std::os::unix::net::UnixListener;
+
+        let root = temp_dir("unsafe");
+        let socket = root.join("socket");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        assert!(validate_source(&socket).is_err());
+
+        let source = root.join("source");
+        let child = source.join("child");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&child).unwrap();
+        let linked_destination = root.join("linked-destination");
+        std::os::unix::fs::symlink(&child, &linked_destination).unwrap();
+        assert!(validate_sources(vec![source], Some(&linked_destination)).is_err());
+        drop(_listener);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn changed_source_is_retained_after_cross_filesystem_copy() {
+        let root = temp_dir("changed");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::write(&source, "before").unwrap();
+        let result = cross_filesystem_move(&source, &destination, || {
+            fs::write(&source, "changed after copy").unwrap();
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(source).unwrap(), "changed after copy");
+        assert_eq!(fs::read_to_string(destination).unwrap(), "before");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cross_filesystem_move_removes_source_after_copy() {
+        let root = temp_dir("cross-device");
+        let shared_memory = PathBuf::from("/dev/shm");
+        if !shared_memory.is_dir()
+            || fs::metadata(&root).unwrap().dev() == fs::metadata(&shared_memory).unwrap().dev()
+        {
+            fs::remove_dir(root).unwrap();
+            return;
+        }
+        let source = root.join("source");
+        let destination = shared_memory.join(format!(
+            "kora-cross-device-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&source, "content").unwrap();
+        cross_filesystem_move(&source, &destination, || {}).unwrap();
+        assert!(!source.exists());
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "content");
+        fs::remove_file(destination).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_and_cleanup_permission_failures_keep_source_data() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_dir("permissions");
+        let source = root.join("source");
+        let blocked = root.join("blocked");
+        fs::write(&source, "content").unwrap();
+        fs::create_dir(&blocked).unwrap();
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(cross_filesystem_move(&source, &blocked.join("destination"), || {}).is_err());
+        assert_eq!(fs::read_to_string(&source).unwrap(), "content");
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let destination_root = temp_dir("cleanup-destination");
+        let destination = destination_root.join("copied");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o500)).unwrap();
+        let result = cross_filesystem_move(&source, &destination, || {});
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&source).unwrap(), "content");
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "content");
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(destination_root).unwrap();
+    }
+
+    #[test]
+    fn failed_cross_filesystem_copy_keeps_source() {
+        let root = temp_dir("failed-copy");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::write(&source, "source").unwrap();
+        fs::write(&destination, "existing").unwrap();
+        assert!(cross_filesystem_move(&source, &destination, || {}).is_err());
+        assert_eq!(fs::read_to_string(source).unwrap(), "source");
+        assert_eq!(fs::read_to_string(destination).unwrap(), "existing");
+        fs::remove_dir_all(root).unwrap();
+    }
+}

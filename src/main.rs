@@ -1,6 +1,7 @@
 mod config;
 mod desktop;
 mod explorer;
+mod operations;
 
 use std::{cell::Cell, process::ExitCode, rc::Rc};
 
@@ -27,17 +28,23 @@ fn main() -> ExitCode {
     let app = gtk::Application::builder()
         .application_id("io.github.kora")
         .build();
+    let operations = operations::OperationQueue::new(&app);
 
     app.connect_activate({
         let config = config.clone();
+        let operations = operations.clone();
         let failed = failed.clone();
         move |app| {
             let result = gtk::gdk::Display::default()
                 .ok_or_else(|| "no display is available".to_string())
                 .and_then(|display| desktop::detect_backend(&display))
                 .and_then(|backend| match backend {
-                    Backend::Wayland => desktop::create_wayland_views(app, config.clone()),
-                    Backend::X11 => desktop::create_x11_views(app, config.clone(), true),
+                    Backend::Wayland => {
+                        desktop::create_wayland_views(app, config.clone(), operations.clone())
+                    }
+                    Backend::X11 => {
+                        desktop::create_x11_views(app, config.clone(), operations.clone(), true)
+                    }
                 });
 
             if let Err(error) = result {

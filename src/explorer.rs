@@ -7,6 +7,8 @@ use std::{
 use gtk::{gio, glib, prelude::*};
 use gtk4 as gtk;
 
+use crate::operations::OperationQueue;
+
 #[cfg(test)]
 use std::{fs, path::Path};
 
@@ -18,6 +20,7 @@ struct Explorer {
     navigation_generation: Cell<u64>,
     directory: gtk::DirectoryList,
     selection: gtk::MultiSelection,
+    operations: Rc<OperationQueue>,
     path_entry: gtk::Entry,
     error_label: gtk::Label,
     recovery: gtk::Box,
@@ -25,7 +28,7 @@ struct Explorer {
     forward_button: gtk::Button,
 }
 
-pub fn view(start: PathBuf, home: PathBuf) -> gtk::Box {
+pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> gtk::Box {
     let panel = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .halign(gtk::Align::Start)
@@ -60,6 +63,11 @@ pub fn view(start: PathBuf, home: PathBuf) -> gtk::Box {
     error_label.set_xalign(0.0);
     error_label.set_wrap(true);
     error_label.add_css_class("error");
+    let operation_label = gtk::Label::new(None);
+    operation_label.set_xalign(0.0);
+    operation_label.set_wrap(true);
+    operation_label.set_visible(false);
+    operations.subscribe(&operation_label);
     let recovery = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let retry_button = gtk::Button::with_label("Retry");
     let recovery_home_button = gtk::Button::with_label("Home");
@@ -141,6 +149,7 @@ pub fn view(start: PathBuf, home: PathBuf) -> gtk::Box {
 
     panel.append(&toolbar);
     panel.append(&error_label);
+    panel.append(&operation_label);
     panel.append(&recovery);
     panel.append(&scroller);
 
@@ -152,6 +161,7 @@ pub fn view(start: PathBuf, home: PathBuf) -> gtk::Box {
         navigation_generation: Cell::new(0),
         directory,
         selection: selection.clone(),
+        operations,
         path_entry,
         error_label,
         recovery,
