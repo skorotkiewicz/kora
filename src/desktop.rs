@@ -114,7 +114,7 @@ fn build_view(settings: &Settings, home: &std::path::Path) -> (gtk::Overlay, gtk
     }
     root.set_child(Some(&background));
 
-    let panel = explorer::start_panel(settings.path.clone(), home.to_path_buf());
+    let panel = explorer::view(settings.path.clone(), home.to_path_buf());
 
     if settings.wallpaper_mode == WallpaperMode::Replace {
         if let Some(path) = &settings.wallpaper_image {
