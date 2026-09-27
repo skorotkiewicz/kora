@@ -200,6 +200,26 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> Vi
             label.set_ellipsize(gtk::pango::EllipsizeMode::End);
             label.set_max_width_chars(14);
             tile.append(&label);
+            let context_selection = gtk::EventControllerLegacy::builder()
+                .propagation_phase(gtk::PropagationPhase::Capture)
+                .build();
+            context_selection.connect_event({
+                let item = item.downgrade();
+                let explorer_slot = explorer_slot.clone();
+                move |_, event| {
+                    if event.event_type() == gtk::gdk::EventType::ButtonPress
+                        && let Some(button) = event.downcast_ref::<gtk::gdk::ButtonEvent>()
+                        && button.button() == 3
+                        && let Some(item) = item.upgrade()
+                        && let Some(explorer) = explorer_slot.borrow().upgrade()
+                        && !explorer.selection.is_selected(item.position())
+                    {
+                        explorer.selection.select_item(item.position(), true);
+                    }
+                    glib::Propagation::Proceed
+                }
+            });
+            tile.add_controller(context_selection);
             let drop_target = gtk::DropTarget::new(
                 gtk::gdk::FileList::static_type(),
                 gtk::gdk::DragAction::COPY | gtk::gdk::DragAction::MOVE,
@@ -251,8 +271,13 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> Vi
             drag_source.connect_prepare({
                 let explorer_slot = explorer_slot.clone();
                 let drag_snapshot = drag_snapshot.clone();
+                let item = item.downgrade();
                 move |_, _, _| {
                     let explorer = explorer_slot.borrow().upgrade()?;
+                    let item = item.upgrade()?;
+                    if !explorer.selection.is_selected(item.position()) {
+                        explorer.selection.select_item(item.position(), true);
+                    }
                     let paths = explorer.selected_paths();
                     if paths.is_empty() {
                         return None;
