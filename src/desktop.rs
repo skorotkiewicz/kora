@@ -223,22 +223,22 @@ fn build_view(
 
     let view = explorer::view(settings.path.clone(), home.to_path_buf(), operations);
 
-    if settings.wallpaper_mode == WallpaperMode::Replace {
-        if let Some(path) = &settings.wallpaper_image {
-            match gdk::Texture::from_file(&gtk::gio::File::for_path(path)) {
-                Ok(texture) => {
-                    let picture = gtk::Picture::for_paintable(&texture);
-                    picture.set_content_fit(gtk::ContentFit::Cover);
-                    picture.set_can_shrink(true);
-                    picture.set_hexpand(true);
-                    picture.set_vexpand(true);
-                    root.add_overlay(&picture);
-                }
-                Err(error) => {
-                    let message = format!("Wallpaper error: {}: {error}", path.display());
-                    glib::g_warning!("kora", "{message}");
-                    view.notifications.append(&gtk::Label::new(Some(&message)));
-                }
+    if settings.wallpaper_mode == WallpaperMode::Replace
+        && let Some(path) = &settings.wallpaper_image
+    {
+        match gdk::Texture::from_file(&gtk::gio::File::for_path(path)) {
+            Ok(texture) => {
+                let picture = gtk::Picture::for_paintable(&texture);
+                picture.set_content_fit(gtk::ContentFit::Cover);
+                picture.set_can_shrink(true);
+                picture.set_hexpand(true);
+                picture.set_vexpand(true);
+                root.add_overlay(&picture);
+            }
+            Err(error) => {
+                let message = format!("Wallpaper error: {}: {error}", path.display());
+                glib::g_warning!("kora", "{message}");
+                view.notifications.append(&gtk::Label::new(Some(&message)));
             }
         }
     }
@@ -274,7 +274,7 @@ fn create_wayland_view(
     window.init_layer_shell();
     window.set_namespace(Some("kora"));
     window.set_layer(Layer::Bottom);
-    window.set_monitor(Some(&monitor));
+    window.set_monitor(Some(monitor));
     for edge in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
         window.set_anchor(edge, true);
     }
@@ -362,7 +362,6 @@ fn create_x11_view(
     monitor: &gdk::Monitor,
     config: &Config,
     operations: Rc<OperationQueue>,
-    require_compositor: bool,
 ) -> Result<gtk::ApplicationWindow, String> {
     let (connection, screen_index) = x11rb::connect(None).map_err(|error| error.to_string())?;
     let root = connection.setup().roots[screen_index].root;
@@ -394,7 +393,8 @@ fn create_x11_view(
         );
     }
 
-    if require_compositor {
+    let settings = config.effective(monitor.connector().as_deref());
+    if settings.wallpaper_mode == WallpaperMode::Transparent {
         let selection = atom(&connection, &format!("_NET_WM_CM_S{screen_index}"))?;
         let owner = connection
             .get_selection_owner(selection)
@@ -408,7 +408,6 @@ fn create_x11_view(
     }
 
     let geometry = monitor.geometry();
-    let settings = config.effective(monitor.connector().as_deref());
     let window = gtk::ApplicationWindow::builder()
         .application(app)
         .title(format!("Kora: {}", settings.path.display()))
@@ -432,11 +431,11 @@ fn create_x11_view(
         .propagation_phase(gtk::PropagationPhase::Capture)
         .build();
     focus.connect_event(move |_, event| {
-        if event.event_type() == gdk::EventType::ButtonPress {
-            if let Ok((connection, _)) = x11rb::connect(None) {
-                let _ = connection.set_input_focus(InputFocus::PARENT, xid, x11rb::CURRENT_TIME);
-                let _ = connection.flush();
-            }
+        if event.event_type() == gdk::EventType::ButtonPress
+            && let Ok((connection, _)) = x11rb::connect(None)
+        {
+            let _ = connection.set_input_focus(InputFocus::PARENT, xid, x11rb::CURRENT_TIME);
+            let _ = connection.flush();
         }
         glib::Propagation::Proceed
     });
@@ -520,7 +519,6 @@ fn sync_x11_views(
     views: &Rc<RefCell<HashMap<String, gtk::ApplicationWindow>>>,
     config: &Config,
     operations: Rc<OperationQueue>,
-    require_compositor: bool,
 ) -> Result<(), String> {
     let mut seen = Vec::new();
     for index in 0..monitors.n_items() {
@@ -531,13 +529,7 @@ fn sync_x11_views(
         let key = monitor_key(&monitor, index);
         seen.push(key.clone());
         if !views.borrow().contains_key(&key) {
-            let window = create_x11_view(
-                app,
-                &monitor,
-                config,
-                operations.clone(),
-                require_compositor,
-            )?;
+            let window = create_x11_view(app, &monitor, config, operations.clone())?;
             views.borrow_mut().insert(key, window);
         }
     }
@@ -555,32 +547,18 @@ pub fn create_x11_views(
     app: &gtk::Application,
     config: Rc<Config>,
     operations: Rc<OperationQueue>,
-    require_compositor: bool,
 ) -> Result<(), String> {
     let display = gdk::Display::default().ok_or("no display is available")?;
     let monitors = display.monitors();
     let views = Rc::new(RefCell::new(HashMap::new()));
-    sync_x11_views(
-        app,
-        &monitors,
-        &views,
-        &config,
-        operations.clone(),
-        require_compositor,
-    )?;
+    sync_x11_views(app, &monitors, &views, &config, operations.clone())?;
     monitors.connect_items_changed({
         let app = app.clone();
         let monitors = monitors.clone();
         let views = views.clone();
         move |_, _, _, _| {
-            if let Err(error) = sync_x11_views(
-                &app,
-                &monitors,
-                &views,
-                &config,
-                operations.clone(),
-                require_compositor,
-            ) {
+            if let Err(error) = sync_x11_views(&app, &monitors, &views, &config, operations.clone())
+            {
                 show_startup_error(&error);
             }
         }

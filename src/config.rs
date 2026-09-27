@@ -77,14 +77,23 @@ impl Config {
     }
 }
 
-pub fn config_argument(
-    args: impl IntoIterator<Item = OsString>,
-) -> Result<Option<PathBuf>, String> {
+#[derive(Debug, PartialEq, Eq)]
+pub enum Command {
+    Run(Option<PathBuf>),
+    Help,
+    Version,
+}
+
+pub fn command(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
     let mut args = args.into_iter();
     args.next();
     let mut config = None;
     while let Some(argument) = args.next() {
-        if argument == "--config" {
+        if argument == "--help" || argument == "-h" {
+            return Ok(Command::Help);
+        } else if argument == "--version" || argument == "-V" {
+            return Ok(Command::Version);
+        } else if argument == "--config" {
             if config.is_some() {
                 return Err("--config may be specified only once".into());
             }
@@ -95,7 +104,7 @@ pub fn config_argument(
             return Err(format!("unknown argument: {}", argument.to_string_lossy()));
         }
     }
-    Ok(config)
+    Ok(Command::Run(config))
 }
 
 pub fn load(explicit: Option<PathBuf>) -> Result<Config, String> {
@@ -194,12 +203,12 @@ fn resolve_partial(
             Some(resolve_path(&image, directory, home))
         }
     });
-    if let Some(color) = &raw.background_color {
-        if !valid_color(color) {
-            return Err(format!(
-                "{context}.background_color must use #RRGGBB format"
-            ));
-        }
+    if let Some(color) = &raw.background_color
+        && !valid_color(color)
+    {
+        return Err(format!(
+            "{context}.background_color must use #RRGGBB format"
+        ));
     }
     Ok(PartialSettings {
         path,
@@ -258,15 +267,34 @@ mod tests {
     #[test]
     fn parses_config_argument() {
         assert_eq!(
-            config_argument([
+            command([
                 OsString::from("kora"),
                 OsString::from("--config"),
                 OsString::from("a.toml")
             ])
             .unwrap(),
-            Some(PathBuf::from("a.toml"))
+            Command::Run(Some(PathBuf::from("a.toml")))
         );
-        assert!(config_argument([OsString::from("kora"), OsString::from("--config")]).is_err());
+        assert!(command([OsString::from("kora"), OsString::from("--config")]).is_err());
+        assert_eq!(
+            command(["kora".into(), "--help".into()]).unwrap(),
+            Command::Help
+        );
+        assert_eq!(
+            command(["kora".into(), "--version".into()]).unwrap(),
+            Command::Version
+        );
+        assert!(command(["kora".into(), "--unknown".into()]).is_err());
+        assert!(
+            command([
+                "kora".into(),
+                "--config".into(),
+                "a".into(),
+                "--config".into(),
+                "b".into()
+            ])
+            .is_err()
+        );
     }
 
     #[test]

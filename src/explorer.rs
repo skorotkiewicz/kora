@@ -97,6 +97,12 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> Vi
     back_button.set_visible(false);
     let hidden_toggle = gtk::CheckButton::with_label("Show hidden files");
     hidden_toggle.set_tooltip_text(Some("Show hidden files (Ctrl+H)"));
+    let folder_button = gtk::Button::from_icon_name("folder-open-symbolic");
+    folder_button.set_tooltip_text(Some(
+        "Current folder: click to enter a path, or drop files here",
+    ));
+    folder_button.update_property(&[gtk::accessible::Property::Label("Current folder")]);
+    controls.append(&folder_button);
     controls.append(&back_button);
     controls.append(&hidden_toggle);
 
@@ -467,10 +473,14 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> Vi
             true
         }
     });
-    grid.add_controller(current_drop);
+    folder_button.add_controller(current_drop);
 
     explorer.navigate(gio::File::for_path(start), false);
 
+    folder_button.connect_clicked(with_explorer(&explorer, |explorer| {
+        explorer.path_entry.set_visible(true);
+        explorer.path_entry.grab_focus();
+    }));
     back_button.connect_clicked(with_explorer(&explorer, {
         let grid = grid.clone();
         move |explorer| {
@@ -511,11 +521,27 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> Vi
     let cut = gtk::Button::with_label("Cut");
     let paste = gtk::Button::with_label("Paste");
     let trash = gtk::Button::with_label("Move to Trash");
-    for button in [&open, &rename, &copy, &cut, &paste, &trash] {
+    let results = gtk::Button::with_label("Operation results");
+    let quit = gtk::Button::with_label("Quit Kora");
+    for button in [&open, &rename, &copy, &cut, &paste, &trash, &results, &quit] {
         button.set_accessible_role(gtk::AccessibleRole::MenuItem);
         menu.append(button);
     }
     popover.set_child(Some(&menu));
+    results.connect_clicked(with_explorer(&explorer, {
+        let popover = popover.clone();
+        move |explorer| {
+            popover.popdown();
+            explorer.show_results();
+        }
+    }));
+    quit.connect_clicked(with_explorer(&explorer, {
+        let popover = popover.clone();
+        move |explorer| {
+            popover.popdown();
+            explorer.confirm_quit();
+        }
+    }));
     open.connect_clicked({
         let explorer = Rc::downgrade(&explorer);
         let popover = popover.clone();
@@ -676,6 +702,7 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> Vi
             recovery.upcast(),
             back_button.upcast(),
             hidden_toggle.upcast(),
+            folder_button.upcast(),
         ],
         notifications,
     }
@@ -1006,6 +1033,34 @@ impl Explorer {
         dialog.present();
     }
 
+    fn show_results(&self) {
+        let dialog = gtk::Dialog::builder()
+            .title("Operation results")
+            .default_width(600)
+            .default_height(320)
+            .build();
+        if let Some(parent) = self.path_entry.root().and_downcast::<gtk::Window>() {
+            dialog.set_transient_for(Some(&parent));
+        }
+        dialog.add_button("Close", gtk::ResponseType::Close);
+        let messages = self.operations.result_messages();
+        let label = gtk::Label::new(Some(if messages.is_empty() {
+            "No completed operations"
+        } else {
+            &messages
+        }));
+        label.set_wrap(true);
+        label.set_selectable(true);
+        label.set_xalign(0.0);
+        let scroller = gtk::ScrolledWindow::builder()
+            .vexpand(true)
+            .child(&label)
+            .build();
+        dialog.content_area().append(&scroller);
+        dialog.connect_response(|dialog, _| dialog.close());
+        dialog.present();
+    }
+
     fn confirm_quit(&self) {
         let Some(parent) = self.path_entry.root().and_downcast::<gtk::Window>() else {
             return;
@@ -1020,11 +1075,12 @@ impl Explorer {
         dialog.add_button("Cancel", gtk::ResponseType::Cancel);
         dialog.add_button("Quit Safely", gtk::ResponseType::Accept);
         dialog.set_default_response(gtk::ResponseType::Cancel);
+        let operations = self.operations.clone();
         dialog.connect_response(move |dialog, response| {
-            if response == gtk::ResponseType::Accept {
-                parent.close();
-            }
             dialog.close();
+            if response == gtk::ResponseType::Accept {
+                operations.quit_when_idle();
+            }
         });
         dialog.present();
     }

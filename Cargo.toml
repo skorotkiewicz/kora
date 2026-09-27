@@ -2,6 +2,10 @@
 name = "kora"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "Desktop folder browsing for Niri and EWMH-compatible X11"
+readme = "README.md"
+include = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock", "README.md", "config.example.toml", "docs/**"]
 
 [dependencies]
 gdk4-x11 = "0.10"

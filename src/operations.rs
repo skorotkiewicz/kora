@@ -1,11 +1,14 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     ffi::OsString,
     fs::{self, OpenOptions},
     io::{Read, Write},
     os::{
         fd::AsRawFd,
-        unix::{fs::MetadataExt, net::UnixStream},
+        unix::{
+            fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+            net::UnixStream,
+        },
     },
     path::{Path, PathBuf},
     rc::Rc,
@@ -15,7 +18,7 @@ use std::{
 
 use gtk::{gio, glib, prelude::*};
 use gtk4 as gtk;
-use rustix::fs::{CWD, RenameFlags, renameat_with};
+use rustix::fs::{CWD, OFlags, RenameFlags, renameat_with};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalDragItem {
@@ -92,14 +95,17 @@ impl OperationResult {
     }
 }
 
+type CompletionCallbacks = Rc<std::cell::RefCell<HashMap<u64, Box<dyn FnOnce(bool)>>>>;
+type IdleCallbacks = Rc<std::cell::RefCell<Vec<Box<dyn FnOnce()>>>>;
+
 pub struct OperationQueue {
     sender: mpsc::Sender<Request>,
     listeners: Rc<std::cell::RefCell<Vec<glib::WeakRef<gtk::Label>>>>,
     results: Arc<Mutex<VecDeque<OperationResult>>>,
-    completion_callbacks: Rc<std::cell::RefCell<HashMap<u64, Box<dyn FnOnce(bool)>>>>,
+    completion_callbacks: CompletionCallbacks,
     holds: Rc<std::cell::RefCell<VecDeque<gio::ApplicationHoldGuard>>>,
     clipboard: std::cell::RefCell<Option<(bool, Vec<PathBuf>)>>,
-    idle_callbacks: Rc<std::cell::RefCell<Vec<Box<dyn FnOnce()>>>>,
+    idle_callbacks: IdleCallbacks,
     internal_drag_moves: std::cell::RefCell<Vec<Vec<PathBuf>>>,
     next_id: std::cell::Cell<u64>,
     app: gtk::Application,
@@ -281,6 +287,21 @@ impl OperationQueue {
         !self.holds.borrow().is_empty()
     }
 
+    pub fn quit_when_idle(&self) {
+        let app = self.app.clone();
+        self.when_idle(move || app.quit());
+    }
+
+    pub fn result_messages(&self) -> String {
+        self.results
+            .lock()
+            .unwrap()
+            .iter()
+            .map(OperationResult::message)
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
     pub fn when_idle(&self, callback: impl FnOnce() + 'static) {
         if self.is_active() {
             self.idle_callbacks.borrow_mut().push(Box::new(callback));
@@ -329,7 +350,12 @@ fn execute(request: Request) -> OperationResult {
             .into_iter()
             .map(|source| {
                 let target = destination.join(source.file_name().unwrap_or_default());
-                item_result(source.clone(), copy_entry(&source, &target))
+                item_result(
+                    source.clone(),
+                    copy_entry(&source, &target).map_err(|error| {
+                        format!("{error}; destination may be partial: {}", target.display())
+                    }),
+                )
             })
             .collect(),
         Ok(Operation::Move {
@@ -339,7 +365,15 @@ fn execute(request: Request) -> OperationResult {
             .into_iter()
             .map(|source| {
                 let target = destination.join(source.file_name().unwrap_or_default());
-                item_result(source.clone(), move_entry(&source, &target))
+                item_result(
+                    source.clone(),
+                    move_entry(&source, &target).map_err(|error| {
+                        format!(
+                            "{error}; check source and destination: {}",
+                            target.display()
+                        )
+                    }),
+                )
             })
             .collect(),
         Ok(Operation::Rename { source, new_name }) => {
@@ -356,11 +390,7 @@ fn execute(request: Request) -> OperationResult {
         Ok(Operation::FinishExternalMove { items }) => items
             .into_iter()
             .map(|item| {
-                let result = if fingerprint(&item.path) == Ok(item.fingerprint) {
-                    remove_entry(&item.path)
-                } else {
-                    Err("source changed after the external drag; source retained".into())
-                };
+                let result = remove_verified(&item.path, &item.fingerprint);
                 item_result(item.path, result)
             })
             .collect(),
@@ -411,8 +441,7 @@ fn validate(operation: Operation) -> Result<Operation, String> {
             validate_source(&source)?;
             let name_path = Path::new(&new_name);
             if new_name.is_empty()
-                || new_name == "."
-                || new_name == ".."
+                || name_path.file_name() != Some(new_name.as_os_str())
                 || name_path.components().count() != 1
             {
                 return Err("invalid destination name".into());
@@ -458,16 +487,22 @@ fn validate_sources(
             continue;
         }
         if let Some(destination) = destination {
-            let source_resolved = fs::canonicalize(&source).map_err(|error| error.to_string())?;
             let destination_resolved =
                 fs::canonicalize(destination).map_err(|error| error.to_string())?;
-            if destination_resolved == source_resolved
-                || destination_resolved.starts_with(&source_resolved)
+            // Only real directories have descendants. Canonicalizing a link follows
+            // its target and incorrectly rejects dangling links and links to ancestors.
+            if fs::symlink_metadata(&source)
+                .map_err(|error| error.to_string())?
+                .is_dir()
             {
-                return Err(format!(
-                    "cannot transfer {} into itself or its descendant",
-                    source.display()
-                ));
+                let source_resolved =
+                    fs::canonicalize(&source).map_err(|error| error.to_string())?;
+                if destination_resolved.starts_with(&source_resolved) {
+                    return Err(format!(
+                        "cannot transfer {} into itself or its descendant",
+                        source.display()
+                    ));
+                }
             }
         }
         normalized.push(source);
@@ -492,21 +527,36 @@ fn copy_entry(source: &Path, destination: &Path) -> Result<(), String> {
         let target = fs::read_link(source).map_err(|error| error.to_string())?;
         std::os::unix::fs::symlink(target, destination).map_err(|error| error.to_string())
     } else if kind.is_file() {
-        let mut input = fs::File::open(source).map_err(|error| error.to_string())?;
+        let mut input = OpenOptions::new()
+            .read(true)
+            .custom_flags((OFlags::NOFOLLOW | OFlags::NONBLOCK).bits() as i32)
+            .open(source)
+            .map_err(|error| error.to_string())?;
+        let opened = input.metadata().map_err(|error| error.to_string())?;
+        if !opened.is_file() || opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
+            return Err("source changed before copying; source retained".into());
+        }
         let mut output = OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(destination)
             .map_err(|error| error.to_string())?;
         std::io::copy(&mut input, &mut output).map_err(|error| error.to_string())?;
+        output
+            .set_permissions(metadata.permissions())
+            .map_err(|error| error.to_string())?;
         output.sync_all().map_err(|error| error.to_string())
     } else if kind.is_dir() {
-        fs::create_dir(destination).map_err(|error| error.to_string())?;
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(destination)
+            .map_err(|error| error.to_string())?;
         for entry in fs::read_dir(source).map_err(|error| error.to_string())? {
             let entry = entry.map_err(|error| error.to_string())?;
             copy_entry(&entry.path(), &destination.join(entry.file_name()))?;
         }
-        Ok(())
+        fs::set_permissions(destination, metadata.permissions()).map_err(|error| error.to_string())
     } else {
         Err(format!("unsupported special file: {}", source.display()))
     }
@@ -532,25 +582,69 @@ struct Fingerprint {
     size: u64,
     modified_seconds: i64,
     modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+    mode: u32,
+    children: BTreeMap<OsString, Fingerprint>,
 }
 
 fn fingerprint(path: &Path) -> Result<Fingerprint, String> {
     let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    validate_source(path)?;
+    let mut children = BTreeMap::new();
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            children.insert(entry.file_name(), fingerprint(&entry.path())?);
+        }
+    }
     Ok(Fingerprint {
         device: metadata.dev(),
         inode: metadata.ino(),
         size: metadata.size(),
         modified_seconds: metadata.mtime(),
         modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+        mode: metadata.mode(),
+        children,
     })
 }
 
-fn remove_entry(path: &Path) -> Result<(), String> {
+fn remove_verified(path: &Path, expected: &Fingerprint) -> Result<(), String> {
+    if fingerprint(path)? != *expected {
+        return Err(format!(
+            "source changed during transfer; retained {}",
+            path.display()
+        ));
+    }
+    remove_verified_entries(path, expected)
+}
+
+fn remove_verified_entries(path: &Path, expected: &Fingerprint) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
-    if metadata.file_type().is_dir() {
-        fs::remove_dir_all(path).map_err(|error| error.to_string())
-    } else {
+    if metadata.dev() != expected.device
+        || metadata.ino() != expected.inode
+        || metadata.mode() != expected.mode
+    {
+        return Err(format!(
+            "source changed during cleanup; retained {}",
+            path.display()
+        ));
+    }
+    if metadata.is_dir() {
+        for (name, child) in &expected.children {
+            remove_verified_entries(&path.join(name), child)?;
+        }
+        // Never remove_dir_all: a new, uncopied entry must prevent directory removal.
+        fs::remove_dir(path).map_err(|error| error.to_string())
+    } else if fingerprint(path)? == *expected {
         fs::remove_file(path).map_err(|error| error.to_string())
+    } else {
+        Err(format!(
+            "source changed during cleanup; retained {}",
+            path.display()
+        ))
     }
 }
 
@@ -568,7 +662,7 @@ fn cross_filesystem_move(
             destination.display()
         ));
     }
-    remove_entry(source)
+    remove_verified(source, &before)
 }
 
 #[cfg(test)]
@@ -628,6 +722,46 @@ mod tests {
                 .count(),
             1
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn external_directory_move_retains_changed_children() {
+        let root = temp_dir("external-directory");
+        let source = root.join("tree");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("child"), "before").unwrap();
+        let item = ExternalDragItem { path: source.clone(), fingerprint: fingerprint(&source).unwrap() };
+        fs::write(source.join("child"), "after transfer").unwrap();
+        let result = execute(Request { id: 30, operation: Operation::FinishExternalMove { items: vec![item] } });
+        assert!(result.items[0].error.is_some());
+        assert_eq!(fs::read_to_string(source.join("child")).unwrap(), "after transfer");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cleanup_retains_entries_added_after_the_whole_tree_check() {
+        let root = temp_dir("cleanup-new-entry");
+        fs::write(root.join("copied"), "copied content").unwrap();
+        let before = fingerprint(&root).unwrap();
+        fs::write(root.join("not-copied"), "new content").unwrap();
+        assert!(remove_verified_entries(&root, &before).is_err());
+        assert_eq!(fs::read_to_string(root.join("not-copied")).unwrap(), "new content");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn directory_move_preserves_contents_and_links() {
+        let root = temp_dir("directory-move");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(source.join("nested/file"), "content").unwrap();
+        std::os::unix::fs::symlink("missing", source.join("broken")).unwrap();
+        cross_filesystem_move(&source, &destination, || {}).unwrap();
+        assert!(!source.exists());
+        assert_eq!(fs::read_to_string(destination.join("nested/file")).unwrap(), "content");
+        assert_eq!(fs::read_link(destination.join("broken")).unwrap(), PathBuf::from("missing"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -757,6 +891,88 @@ mod tests {
     }
 
     #[test]
+    fn changed_child_is_retained_after_directory_copy() {
+        let root = temp_dir("changed-child");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("child"), "before").unwrap();
+        let result = cross_filesystem_move(&source, &destination, || {
+            fs::write(source.join("child"), "after copying").unwrap();
+        });
+        assert!(
+            result.is_err(),
+            "a changed child must prevent source removal"
+        );
+        assert_eq!(
+            fs::read_to_string(source.join("child")).unwrap(),
+            "after copying"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("child")).unwrap(),
+            "before"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn copy_preserves_private_and_executable_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_dir("copy-modes");
+        for mode in [0o600, 0o700, 0o640] {
+            let source = root.join(format!("source-{mode:o}"));
+            let destination = root.join(format!("copy-{mode:o}"));
+            fs::write(&source, "content").unwrap();
+            fs::set_permissions(&source, fs::Permissions::from_mode(mode)).unwrap();
+            copy_entry(&source, &destination).unwrap();
+            assert_eq!(fs::metadata(&destination).unwrap().mode() & 0o777, mode);
+        }
+        let source = root.join("private-directory");
+        fs::create_dir(&source).unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
+        copy_entry(&source, &root.join("directory-copy")).unwrap();
+        assert_eq!(
+            fs::metadata(root.join("directory-copy")).unwrap().mode() & 0o777,
+            0o700
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn broken_symlink_is_transferable_without_following_its_target() {
+        let root = temp_dir("broken-link");
+        let source = root.join("broken");
+        let destination = root.join("destination");
+        fs::create_dir(&destination).unwrap();
+        std::os::unix::fs::symlink("missing", &source).unwrap();
+        let result = execute(Request {
+            id: 20,
+            operation: Operation::Copy {
+                sources: vec![source.clone()],
+                destination: destination.clone(),
+            },
+        });
+        assert!(
+            result.items[0].error.is_none(),
+            "{:?}",
+            result.items[0].error
+        );
+        assert_eq!(
+            fs::read_link(destination.join("broken")).unwrap(),
+            PathBuf::from("missing")
+        );
+        let result = execute(Request {
+            id: 21,
+            operation: Operation::Rename {
+                source,
+                new_name: "renamed".into(),
+            },
+        });
+        assert!(result.items[0].error.is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn cross_filesystem_move_removes_source_after_copy() {
         let root = temp_dir("cross-device");
         let shared_memory = PathBuf::from("/dev/shm");
@@ -773,7 +989,7 @@ mod tests {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::write(&source, "content").unwrap();
-        cross_filesystem_move(&source, &destination, || {}).unwrap();
+        move_entry(&source, &destination).unwrap();
         assert!(!source.exists());
         assert_eq!(fs::read_to_string(&destination).unwrap(), "content");
         fs::remove_file(destination).unwrap();
