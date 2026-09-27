@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     ffi::OsString,
     fs::{self, OpenOptions},
     io::{Read, Write},
@@ -18,6 +18,12 @@ use gtk4 as gtk;
 use rustix::fs::{CWD, RenameFlags, renameat_with};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalDragItem {
+    path: PathBuf,
+    fingerprint: Fingerprint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Operation {
     Copy {
         sources: Vec<PathBuf>,
@@ -33,6 +39,9 @@ pub enum Operation {
     },
     Trash {
         paths: Vec<PathBuf>,
+    },
+    FinishExternalMove {
+        items: Vec<ExternalDragItem>,
     },
 }
 
@@ -87,9 +96,11 @@ pub struct OperationQueue {
     sender: mpsc::Sender<Request>,
     listeners: Rc<std::cell::RefCell<Vec<glib::WeakRef<gtk::Label>>>>,
     results: Arc<Mutex<VecDeque<OperationResult>>>,
+    completion_callbacks: Rc<std::cell::RefCell<HashMap<u64, Box<dyn FnOnce(bool)>>>>,
     holds: Rc<std::cell::RefCell<VecDeque<gio::ApplicationHoldGuard>>>,
     clipboard: std::cell::RefCell<Option<(bool, Vec<PathBuf>)>>,
     idle_callbacks: Rc<std::cell::RefCell<Vec<Box<dyn FnOnce()>>>>,
+    internal_drag_moves: std::cell::RefCell<Vec<Vec<PathBuf>>>,
     next_id: std::cell::Cell<u64>,
     app: gtk::Application,
 }
@@ -102,7 +113,9 @@ impl OperationQueue {
             .set_nonblocking(true)
             .expect("make operation event pipe nonblocking");
         let results = Arc::new(Mutex::new(VecDeque::new()));
+        let completed = Arc::new(Mutex::new(VecDeque::new()));
         let worker_results = results.clone();
+        let worker_completed = completed.clone();
         thread::Builder::new()
             .name("kora-files".into())
             .spawn(move || {
@@ -114,6 +127,7 @@ impl OperationQueue {
                         seen.clear();
                         seen.insert(result.id);
                     }
+                    worker_completed.lock().unwrap().push_back(result.clone());
                     let mut stored = worker_results.lock().unwrap();
                     stored.push_back(result);
                     while stored.len() > 100 {
@@ -132,22 +146,28 @@ impl OperationQueue {
             VecDeque::<gio::ApplicationHoldGuard>::new(),
         ));
         let idle_callbacks = Rc::new(std::cell::RefCell::new(Vec::<Box<dyn FnOnce()>>::new()));
-        let source_results = results.clone();
+        let completion_callbacks = Rc::new(std::cell::RefCell::new(HashMap::<
+            u64,
+            Box<dyn FnOnce(bool)>,
+        >::new()));
+        let source_completed = completed.clone();
+        let source_callbacks = completion_callbacks.clone();
         let source_listeners = listeners.clone();
         let source_holds = holds.clone();
         let source_idle_callbacks = idle_callbacks.clone();
         glib::source::unix_fd_add_local(reader.as_raw_fd(), glib::IOCondition::IN, move |_, _| {
             let mut bytes = [0; 64];
-            let completed = match reader.read(&mut bytes) {
-                Ok(count) => count,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => 0,
+            match reader.read(&mut bytes) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(_) => return glib::ControlFlow::Break,
-            };
-            let message = source_results
+            }
+            let completed = source_completed
                 .lock()
                 .unwrap()
-                .back()
-                .map(OperationResult::message);
+                .drain(..)
+                .collect::<Vec<_>>();
+            let message = completed.last().map(OperationResult::message);
             source_listeners.borrow_mut().retain(|weak| {
                 if let Some(label) = weak.upgrade() {
                     if let Some(message) = &message {
@@ -159,8 +179,11 @@ impl OperationQueue {
                     false
                 }
             });
-            for _ in 0..completed {
+            for result in completed {
                 source_holds.borrow_mut().pop_front();
+                if let Some(callback) = source_callbacks.borrow_mut().remove(&result.id) {
+                    callback(result.items.iter().all(|item| item.error.is_none()));
+                }
             }
             if source_holds.borrow().is_empty() {
                 for callback in source_idle_callbacks.take() {
@@ -174,9 +197,11 @@ impl OperationQueue {
             sender,
             listeners,
             results,
+            completion_callbacks,
             holds,
             clipboard: std::cell::RefCell::new(None),
             idle_callbacks,
+            internal_drag_moves: std::cell::RefCell::new(Vec::new()),
             next_id: std::cell::Cell::new(1),
             app: app.clone(),
         })
@@ -193,10 +218,55 @@ impl OperationQueue {
     }
 
     pub fn enqueue(&self, operation: Operation) -> Result<u64, String> {
+        self.enqueue_with_callback(operation, |_| {})
+    }
+
+    pub fn enqueue_with_callback(
+        &self,
+        operation: Operation,
+        callback: impl FnOnce(bool) + 'static,
+    ) -> Result<u64, String> {
         let id = self.next_id.get();
         self.next_id.set(id.wrapping_add(1));
-        self.submit(Request { id, operation })?;
+        self.completion_callbacks
+            .borrow_mut()
+            .insert(id, Box::new(callback));
+        if let Err(error) = self.submit(Request { id, operation }) {
+            self.completion_callbacks.borrow_mut().remove(&id);
+            return Err(error);
+        }
         Ok(id)
+    }
+
+    pub fn snapshot_external_drag(
+        &self,
+        paths: &[PathBuf],
+    ) -> Result<Vec<ExternalDragItem>, String> {
+        validate_sources(paths.to_vec(), None)?
+            .iter()
+            .map(|path| {
+                Ok(ExternalDragItem {
+                    path: path.clone(),
+                    fingerprint: fingerprint(path)?,
+                })
+            })
+            .collect()
+    }
+
+    pub fn mark_internal_drag_move(&self, mut paths: Vec<PathBuf>) {
+        paths.sort();
+        self.internal_drag_moves.borrow_mut().push(paths);
+    }
+
+    pub fn consume_internal_drag_move(&self, paths: &[PathBuf]) -> bool {
+        let mut paths = paths.to_vec();
+        paths.sort();
+        let mut moves = self.internal_drag_moves.borrow_mut();
+        let Some(index) = moves.iter().position(|candidate| *candidate == paths) else {
+            return false;
+        };
+        moves.remove(index);
+        true
     }
 
     pub fn set_clipboard(&self, paths: Vec<PathBuf>, move_files: bool) {
@@ -283,6 +353,17 @@ fn execute(request: Request) -> OperationResult {
             .into_iter()
             .map(|path| item_result(path.clone(), trash_path(&path)))
             .collect(),
+        Ok(Operation::FinishExternalMove { items }) => items
+            .into_iter()
+            .map(|item| {
+                let result = if fingerprint(&item.path) == Ok(item.fingerprint) {
+                    remove_entry(&item.path)
+                } else {
+                    Err("source changed after the external drag; source retained".into())
+                };
+                item_result(item.path, result)
+            })
+            .collect(),
         Err(error) => vec![ItemResult {
             path: PathBuf::new(),
             error: Some(error),
@@ -341,6 +422,15 @@ fn validate(operation: Operation) -> Result<Operation, String> {
         Operation::Trash { paths } => Ok(Operation::Trash {
             paths: validate_sources(paths, None)?,
         }),
+        Operation::FinishExternalMove { items } => {
+            if items.is_empty() {
+                return Err("external move contains no source items".into());
+            }
+            for item in &items {
+                validate_source(&item.path)?;
+            }
+            Ok(Operation::FinishExternalMove { items })
+        }
     }
 }
 
@@ -435,7 +525,7 @@ fn move_entry(source: &Path, destination: &Path) -> Result<(), String> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Fingerprint {
     device: u64,
     inode: u64,
@@ -455,6 +545,15 @@ fn fingerprint(path: &Path) -> Result<Fingerprint, String> {
     })
 }
 
+fn remove_entry(path: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_dir() {
+        fs::remove_dir_all(path).map_err(|error| error.to_string())
+    } else {
+        fs::remove_file(path).map_err(|error| error.to_string())
+    }
+}
+
 fn cross_filesystem_move(
     source: &Path,
     destination: &Path,
@@ -469,12 +568,7 @@ fn cross_filesystem_move(
             destination.display()
         ));
     }
-    let metadata = fs::symlink_metadata(source).map_err(|error| error.to_string())?;
-    if metadata.file_type().is_dir() {
-        fs::remove_dir_all(source).map_err(|error| error.to_string())
-    } else {
-        fs::remove_file(source).map_err(|error| error.to_string())
-    }
+    remove_entry(source)
 }
 
 #[cfg(test)]
@@ -493,6 +587,48 @@ mod tests {
         ));
         fs::create_dir(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn external_drag_deletes_only_after_successful_move_completion() {
+        let root = temp_dir("external-drag");
+        let copied = root.join("copied");
+        let cancelled = root.join("cancelled");
+        let changed = root.join("changed");
+        fs::write(&copied, "copied").unwrap();
+        fs::write(&cancelled, "cancelled").unwrap();
+        fs::write(&changed, "before").unwrap();
+        let copied_item = ExternalDragItem {
+            path: copied.clone(),
+            fingerprint: fingerprint(&copied).unwrap(),
+        };
+        let changed_item = ExternalDragItem {
+            path: changed.clone(),
+            fingerprint: fingerprint(&changed).unwrap(),
+        };
+
+        assert!(copied.exists());
+        assert!(cancelled.exists());
+        fs::write(&changed, "changed after drag").unwrap();
+        let result = execute(Request {
+            id: 9,
+            operation: Operation::FinishExternalMove {
+                items: vec![copied_item, changed_item],
+            },
+        });
+
+        assert!(!copied.exists());
+        assert!(cancelled.exists());
+        assert_eq!(fs::read_to_string(&changed).unwrap(), "changed after drag");
+        assert_eq!(
+            result
+                .items
+                .iter()
+                .filter(|item| item.error.is_some())
+                .count(),
+            1
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

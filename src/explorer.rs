@@ -7,7 +7,7 @@ use std::{
 use gtk::{gio, glib, prelude::*};
 use gtk4 as gtk;
 
-use crate::operations::{Operation, OperationQueue};
+use crate::operations::{ExternalDragItem, Operation, OperationQueue};
 
 fn trash_operation(paths: Vec<PathBuf>, confirmed: bool) -> Option<Operation> {
     confirmed.then_some(Operation::Trash { paths })
@@ -49,7 +49,7 @@ fn drag_provider(paths: &[PathBuf]) -> gtk::gdk::ContentProvider {
         "text/uri-list",
         &glib::Bytes::from(uri_list.as_bytes()),
     );
-    gtk::gdk::ContentProvider::new_union(&[native, uri])
+    gtk::gdk::ContentProvider::new_union(&[uri, native])
 }
 
 #[cfg(test)]
@@ -107,10 +107,9 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> gt
     error_label.set_xalign(0.0);
     error_label.set_wrap(true);
     error_label.add_css_class("error");
-    let operation_label = gtk::Label::new(None);
+    let operation_label = gtk::Label::new(Some("File operations: idle"));
     operation_label.set_xalign(0.0);
     operation_label.set_wrap(true);
-    operation_label.set_visible(false);
     operations.subscribe(&operation_label);
     let drop_label = gtk::Label::new(Some("Drag status: idle"));
     drop_label.set_xalign(0.0);
@@ -219,20 +218,53 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> gt
             });
             tile.add_controller(drop_target);
             let drag_source = gtk::DragSource::new();
+            let drag_snapshot =
+                Rc::new(RefCell::new(None::<(Vec<PathBuf>, Vec<ExternalDragItem>)>));
             drag_source.set_propagation_phase(gtk::PropagationPhase::Capture);
             drag_source.set_actions(gtk::gdk::DragAction::COPY | gtk::gdk::DragAction::MOVE);
             drag_source.connect_prepare({
                 let explorer_slot = explorer_slot.clone();
+                let drag_snapshot = drag_snapshot.clone();
                 move |_, _, _| {
                     let explorer = explorer_slot.borrow().upgrade()?;
                     let paths = explorer.selected_paths();
                     if paths.is_empty() {
-                        None
-                    } else {
-                        explorer
-                            .drop_label
-                            .set_label(&format!("Dragging {} item(s)", paths.len()));
-                        Some(drag_provider(&paths))
+                        return None;
+                    }
+                    let snapshot = match explorer.operations.snapshot_external_drag(&paths) {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            explorer.show_operation_error(&error);
+                            return None;
+                        }
+                    };
+                    *drag_snapshot.borrow_mut() = Some((paths.clone(), snapshot));
+                    explorer
+                        .drop_label
+                        .set_label(&format!("Dragging {} item(s)", paths.len()));
+                    Some(drag_provider(&paths))
+                }
+            });
+            drag_source.connect_drag_end({
+                let explorer_slot = explorer_slot.clone();
+                let drag_snapshot = drag_snapshot.clone();
+                move |_, _, delete_data| {
+                    let Some((paths, items)) = drag_snapshot.borrow_mut().take() else {
+                        return;
+                    };
+                    let Some(explorer) = explorer_slot.borrow().upgrade() else {
+                        return;
+                    };
+                    explorer.drop_label.set_label("Drag status: idle");
+                    let internal_move = explorer.operations.consume_internal_drag_move(&paths);
+                    if !delete_data || internal_move {
+                        return;
+                    }
+                    if let Err(error) = explorer
+                        .operations
+                        .enqueue(Operation::FinishExternalMove { items })
+                    {
+                        explorer.show_operation_error(&error);
                     }
                 }
             });
@@ -290,28 +322,33 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> gt
     });
     *explorer_slot.borrow_mut() = Rc::downgrade(&explorer);
 
-    let current_drop = gtk::DropTarget::new(
-        gtk::gdk::FileList::static_type(),
+    let formats = gtk::gdk::ContentFormats::for_type(gtk::gdk::FileList::static_type());
+    let current_drop = gtk::DropTargetAsync::new(
+        Some(formats),
         gtk::gdk::DragAction::COPY | gtk::gdk::DragAction::MOVE,
     );
-    current_drop.set_preload(true);
-    current_drop.connect_motion({
+    let current_drop_action = Rc::new(Cell::new(gtk::gdk::DragAction::empty()));
+    current_drop.connect_drag_motion({
         let explorer = Rc::downgrade(&explorer);
-        move |target, _, _| {
+        let current_drop_action = current_drop_action.clone();
+        move |target, drop, _, _| {
             let Some(explorer) = explorer.upgrade() else {
                 return gtk::gdk::DragAction::empty();
             };
             let Some(destination) = explorer.current.borrow().path() else {
                 return gtk::gdk::DragAction::empty();
             };
-            let action = Explorer::drop_action(target);
+            let action = Explorer::async_drop_action(target, drop);
+            current_drop_action.set(action);
             explorer.show_drop_action(&destination, action);
             action
         }
     });
-    current_drop.connect_leave({
+    current_drop.connect_drag_leave({
         let explorer = Rc::downgrade(&explorer);
-        move |_| {
+        let current_drop_action = current_drop_action.clone();
+        move |_, _| {
+            current_drop_action.set(gtk::gdk::DragAction::empty());
             if let Some(explorer) = explorer.upgrade() {
                 explorer.drop_label.set_label("Drag status: idle");
             }
@@ -319,14 +356,78 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> gt
     });
     current_drop.connect_drop({
         let explorer = Rc::downgrade(&explorer);
-        move |target, value, _, _| {
+        let current_drop_action = current_drop_action.clone();
+        move |_, drop, _, _| {
             let Some(explorer) = explorer.upgrade() else {
                 return false;
             };
             let Some(destination) = explorer.current.borrow().path() else {
                 return false;
             };
-            explorer.accept_drop(target, value, destination)
+            let action = current_drop_action.replace(gtk::gdk::DragAction::empty());
+            if action.is_empty() {
+                return false;
+            }
+            let internal = drop.drag().is_some();
+            let drop = drop.clone();
+            let operations = explorer.operations.clone();
+            let weak_explorer = Rc::downgrade(&explorer);
+            drop.clone().read_value_async(
+                gtk::gdk::FileList::static_type(),
+                glib::Priority::DEFAULT,
+                gio::Cancellable::NONE,
+                move |value| {
+                    let sources = value
+                        .map_err(|error| error.to_string())
+                        .and_then(|value| {
+                            value
+                                .get::<gtk::gdk::FileList>()
+                                .map_err(|error| error.to_string())
+                        })
+                        .and_then(|files| local_drag_paths(&files.files()));
+                    let sources = match sources {
+                        Ok(sources) => sources,
+                        Err(error) => {
+                            if let Some(explorer) = weak_explorer.upgrade() {
+                                explorer.show_operation_error(&error);
+                            }
+                            drop.finish(gtk::gdk::DragAction::empty());
+                            return;
+                        }
+                    };
+                    let operation = if action == gtk::gdk::DragAction::MOVE && internal {
+                        Operation::Move {
+                            sources: sources.clone(),
+                            destination,
+                        }
+                    } else {
+                        Operation::Copy {
+                            sources: sources.clone(),
+                            destination,
+                        }
+                    };
+                    let finished_drop = drop.clone();
+                    match operations.enqueue_with_callback(operation, move |success| {
+                        finished_drop.finish(if success {
+                            action
+                        } else {
+                            gtk::gdk::DragAction::empty()
+                        });
+                    }) {
+                        Ok(_) if action == gtk::gdk::DragAction::MOVE && internal => {
+                            operations.mark_internal_drag_move(sources);
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            if let Some(explorer) = weak_explorer.upgrade() {
+                                explorer.show_operation_error(&error);
+                            }
+                            drop.finish(gtk::gdk::DragAction::empty());
+                        }
+                    }
+                },
+            );
+            true
         }
     });
     current_drop_zone.add_controller(current_drop);
@@ -638,6 +739,25 @@ impl Explorer {
         }
     }
 
+    fn async_drop_action(
+        target: &gtk::DropTargetAsync,
+        drop: &gtk::gdk::Drop,
+    ) -> gtk::gdk::DragAction {
+        let offered = drop.actions();
+        let explicit_move = target
+            .current_event_state()
+            .contains(gtk::gdk::ModifierType::SHIFT_MASK);
+        if explicit_move && offered.contains(gtk::gdk::DragAction::MOVE) {
+            gtk::gdk::DragAction::MOVE
+        } else if offered.contains(gtk::gdk::DragAction::COPY) {
+            gtk::gdk::DragAction::COPY
+        } else if offered.contains(gtk::gdk::DragAction::MOVE) {
+            gtk::gdk::DragAction::MOVE
+        } else {
+            gtk::gdk::DragAction::empty()
+        }
+    }
+
     fn show_drop_action(&self, destination: &std::path::Path, action: gtk::gdk::DragAction) {
         if action.is_empty() {
             self.drop_label
@@ -671,7 +791,9 @@ impl Explorer {
             }
         };
         let action = Self::drop_action(target);
-        let operation = if action == gtk::gdk::DragAction::MOVE {
+        let internal_move = action == gtk::gdk::DragAction::MOVE;
+        let moved_sources = sources.clone();
+        let operation = if internal_move {
             Operation::Move {
                 sources,
                 destination,
@@ -689,6 +811,9 @@ impl Explorer {
             self.show_operation_error(&error);
             false
         } else {
+            if internal_move {
+                self.operations.mark_internal_drag_move(moved_sources);
+            }
             true
         }
     }
