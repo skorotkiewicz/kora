@@ -20,7 +20,7 @@ fn main() -> ExitCode {
                 .and_then(|display| desktop::detect_backend(&display))
                 .and_then(|backend| match backend {
                     Backend::Wayland => desktop::create_wayland_view(app).map(|_| ()),
-                    Backend::X11 => Err("X11 desktop integration is not implemented yet".into()),
+                    Backend::X11 => desktop::create_x11_view(app, true).map(|_| ()),
                 });
 
             if let Err(error) = result {
