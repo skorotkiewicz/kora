@@ -86,50 +86,58 @@ fn set_desktop_input_region(window: &gtk::ApplicationWindow, view: &explorer::Vi
         add_widget_to_input_region(&region, window, widget);
     }
     surface.set_input_region(&region);
+    // Wayland commits the changed input region on the next frame.
+    surface.queue_render();
+}
+
+fn queue_desktop_input_region(
+    window: &gtk::ApplicationWindow,
+    view: &explorer::View,
+    pending: &Rc<std::cell::Cell<bool>>,
+) {
+    if pending.replace(true) {
+        return;
+    }
+    let window = window.clone();
+    let view = view.clone();
+    let pending = pending.clone();
+    let grid = view.grid.clone();
+    grid.add_tick_callback(move |_, _| {
+        glib::idle_add_local_once({
+            let window = window.clone();
+            let view = view.clone();
+            let pending = pending.clone();
+            move || {
+                set_desktop_input_region(&window, &view);
+                pending.set(false);
+            }
+        });
+        glib::ControlFlow::Break
+    });
 }
 
 fn install_desktop_input_region(window: &gtk::ApplicationWindow, view: &explorer::View) {
     let pending = Rc::new(std::cell::Cell::new(false));
-    let update = {
-        let pending = pending.clone();
-        move |window: &gtk::ApplicationWindow, view: &explorer::View| {
-            if pending.replace(true) {
-                return;
-            }
-            let window = window.clone();
-            let view = view.clone();
-            let pending = pending.clone();
-            view.grid.add_tick_callback(move |_, _| {
-                glib::idle_add_local_once({
-                    let window = window.clone();
-                    let view = view.clone();
-                    let pending = pending.clone();
-                    move || {
-                        set_desktop_input_region(&window, &view);
-                        pending.set(false);
-                    }
-                });
-                glib::ControlFlow::Break
-            });
-        }
-    };
     view.tiles.connect_items_changed({
         let window = window.clone();
         let view = view.clone();
-        move |_, _, _, _| update(&window, &view)
+        let pending = pending.clone();
+        move |_, _, _, _| queue_desktop_input_region(&window, &view, &pending)
     });
     if let Some(model) = view.grid.model() {
         model.connect_items_changed({
             let window = window.clone();
             let view = view.clone();
-            move |_, _, _, _| update(&window, &view)
+            let pending = pending.clone();
+            move |_, _, _, _| queue_desktop_input_region(&window, &view, &pending)
         });
     }
     for property in ["width", "height"] {
         view.grid.connect_notify_local(Some(property), {
             let window = window.clone();
             let view = view.clone();
-            move |_, _| update(&window, &view)
+            let pending = pending.clone();
+            move |_, _| queue_desktop_input_region(&window, &view, &pending)
         });
     }
     if let Some(scroller) = view.grid.ancestor(gtk::ScrolledWindow::static_type()) {
@@ -137,22 +145,25 @@ fn install_desktop_input_region(window: &gtk::ApplicationWindow, view: &explorer
         scroller.vadjustment().connect_value_changed({
             let window = window.clone();
             let view = view.clone();
-            move |_| update(&window, &view)
+            let pending = pending.clone();
+            move |_| queue_desktop_input_region(&window, &view, &pending)
         });
     }
     for widget in &view.input_widgets {
         widget.connect_notify_local(Some("visible"), {
             let window = window.clone();
             let view = view.clone();
-            move |_, _| update(&window, &view)
+            let pending = pending.clone();
+            move |_, _| queue_desktop_input_region(&window, &view, &pending)
         });
     }
     window.connect_notify_local(Some("scale-factor"), {
         let window = window.clone();
         let view = view.clone();
-        move |_, _| update(&window, &view)
+        let pending = pending.clone();
+        move |_, _| queue_desktop_input_region(&window, &view, &pending)
     });
-    update(window, view);
+    queue_desktop_input_region(window, view, &pending);
 }
 
 fn install_safe_close(window: &gtk::ApplicationWindow, operations: &Rc<OperationQueue>) {
