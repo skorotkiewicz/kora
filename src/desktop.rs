@@ -12,6 +12,8 @@ use x11rb::{
     wrapper::ConnectionExt as _,
 };
 
+use crate::config::Config;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     Wayland,
@@ -93,7 +95,9 @@ fn validate_wayland_capabilities(supported: bool, version: u32) -> Result<(), St
 fn create_wayland_view(
     app: &gtk::Application,
     monitor: &gdk::Monitor,
+    config: &Config,
 ) -> Result<gtk::ApplicationWindow, String> {
+    let settings = config.effective(monitor.connector().as_deref());
     let window = gtk::ApplicationWindow::builder()
         .application(app)
         .title("Kora")
@@ -118,7 +122,7 @@ fn create_wayland_view(
         .margin_top(16)
         .margin_start(16)
         .build();
-    panel.append(&gtk::Label::new(Some("Kora")));
+    panel.append(&gtk::Label::new(Some(&settings.path.display().to_string())));
     let click = gtk::GestureClick::new();
     click.connect_pressed({
         let window = window.clone();
@@ -139,6 +143,7 @@ fn sync_wayland_views(
     app: &gtk::Application,
     monitors: &gtk::gio::ListModel,
     views: &Rc<RefCell<HashMap<String, gtk::ApplicationWindow>>>,
+    config: &Config,
 ) -> Result<(), String> {
     let mut seen = Vec::new();
     for index in 0..monitors.n_items() {
@@ -149,7 +154,7 @@ fn sync_wayland_views(
         let key = monitor_key(&monitor, index);
         seen.push(key.clone());
         if !views.borrow().contains_key(&key) {
-            let window = create_wayland_view(app, &monitor)?;
+            let window = create_wayland_view(app, &monitor, config)?;
             views.borrow_mut().insert(key, window);
         }
     }
@@ -163,7 +168,7 @@ fn sync_wayland_views(
     Ok(())
 }
 
-pub fn create_wayland_views(app: &gtk::Application) -> Result<(), String> {
+pub fn create_wayland_views(app: &gtk::Application, config: Rc<Config>) -> Result<(), String> {
     validate_wayland_capabilities(
         gtk4_layer_shell::is_supported(),
         gtk4_layer_shell::protocol_version(),
@@ -171,13 +176,13 @@ pub fn create_wayland_views(app: &gtk::Application) -> Result<(), String> {
     let display = gdk::Display::default().ok_or("no display is available")?;
     let monitors = display.monitors();
     let views = Rc::new(RefCell::new(HashMap::new()));
-    sync_wayland_views(app, &monitors, &views)?;
+    sync_wayland_views(app, &monitors, &views, &config)?;
     monitors.connect_items_changed({
         let app = app.clone();
         let monitors = monitors.clone();
         let views = views.clone();
         move |_, _, _, _| {
-            if let Err(error) = sync_wayland_views(&app, &monitors, &views) {
+            if let Err(error) = sync_wayland_views(&app, &monitors, &views, &config) {
                 show_startup_error(&error);
             }
         }
@@ -197,6 +202,7 @@ fn atom(connection: &impl Connection, name: &str) -> Result<u32, String> {
 fn create_x11_view(
     app: &gtk::Application,
     monitor: &gdk::Monitor,
+    config: &Config,
     require_compositor: bool,
 ) -> Result<gtk::ApplicationWindow, String> {
     let (connection, screen_index) = x11rb::connect(None).map_err(|error| error.to_string())?;
@@ -243,9 +249,10 @@ fn create_x11_view(
     }
 
     let geometry = monitor.geometry();
+    let settings = config.effective(monitor.connector().as_deref());
     let window = gtk::ApplicationWindow::builder()
         .application(app)
-        .title("Kora")
+        .title(format!("Kora: {}", settings.path.display()))
         .decorated(false)
         .focusable(true)
         .default_width(geometry.width())
@@ -257,7 +264,7 @@ fn create_x11_view(
         .margin_top(16)
         .margin_start(16)
         .build();
-    panel.append(&gtk::Label::new(Some("Kora")));
+    panel.append(&gtk::Label::new(Some(&settings.path.display().to_string())));
     window.set_child(Some(&panel));
     gtk::prelude::WidgetExt::realize(&window);
 
@@ -352,6 +359,7 @@ fn sync_x11_views(
     app: &gtk::Application,
     monitors: &gtk::gio::ListModel,
     views: &Rc<RefCell<HashMap<String, gtk::ApplicationWindow>>>,
+    config: &Config,
     require_compositor: bool,
 ) -> Result<(), String> {
     let mut seen = Vec::new();
@@ -363,7 +371,7 @@ fn sync_x11_views(
         let key = monitor_key(&monitor, index);
         seen.push(key.clone());
         if !views.borrow().contains_key(&key) {
-            let window = create_x11_view(app, &monitor, require_compositor)?;
+            let window = create_x11_view(app, &monitor, config, require_compositor)?;
             views.borrow_mut().insert(key, window);
         }
     }
@@ -377,17 +385,22 @@ fn sync_x11_views(
     Ok(())
 }
 
-pub fn create_x11_views(app: &gtk::Application, require_compositor: bool) -> Result<(), String> {
+pub fn create_x11_views(
+    app: &gtk::Application,
+    config: Rc<Config>,
+    require_compositor: bool,
+) -> Result<(), String> {
     let display = gdk::Display::default().ok_or("no display is available")?;
     let monitors = display.monitors();
     let views = Rc::new(RefCell::new(HashMap::new()));
-    sync_x11_views(app, &monitors, &views, require_compositor)?;
+    sync_x11_views(app, &monitors, &views, &config, require_compositor)?;
     monitors.connect_items_changed({
         let app = app.clone();
         let monitors = monitors.clone();
         let views = views.clone();
         move |_, _, _, _| {
-            if let Err(error) = sync_x11_views(&app, &monitors, &views, require_compositor) {
+            if let Err(error) = sync_x11_views(&app, &monitors, &views, &config, require_compositor)
+            {
                 show_startup_error(&error);
             }
         }
