@@ -17,6 +17,7 @@ struct Explorer {
     forward: RefCell<Vec<gio::File>>,
     navigation_generation: Cell<u64>,
     directory: gtk::DirectoryList,
+    selection: gtk::MultiSelection,
     path_entry: gtk::Entry,
     error_label: gtk::Label,
     recovery: gtk::Box,
@@ -150,6 +151,7 @@ pub fn view(start: PathBuf, home: PathBuf) -> gtk::Box {
         forward: RefCell::new(Vec::new()),
         navigation_generation: Cell::new(0),
         directory,
+        selection: selection.clone(),
         path_entry,
         error_label,
         recovery,
@@ -193,24 +195,42 @@ pub fn view(start: PathBuf, home: PathBuf) -> gtk::Box {
     grid.connect_activate({
         let explorer = Rc::downgrade(&explorer);
         move |_, position| {
-            let Some(explorer) = explorer.upgrade() else {
-                return;
-            };
-            let Some(info) = selection.item(position).and_downcast::<gio::FileInfo>() else {
-                return;
-            };
-            let child = explorer.current.borrow().child(info.name());
-            let file_type =
-                child.query_file_type(gio::FileQueryInfoFlags::NONE, gio::Cancellable::NONE);
-            if file_type == gio::FileType::Directory {
-                explorer.navigate(child, true);
-            } else if info.is_symlink() && file_type == gio::FileType::Unknown {
-                explorer.show_error("broken symbolic link");
-            } else {
-                explorer.launch(&child);
+            if let Some(explorer) = explorer.upgrade() {
+                explorer.activate(position);
             }
         }
     });
+    let popover = gtk::Popover::new();
+    popover.set_parent(&grid);
+    popover.set_accessible_role(gtk::AccessibleRole::Menu);
+    let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let open = gtk::Button::with_label("Open");
+    open.set_accessible_role(gtk::AccessibleRole::MenuItem);
+    menu.append(&open);
+    popover.set_child(Some(&menu));
+    open.connect_clicked({
+        let explorer = Rc::downgrade(&explorer);
+        let popover = popover.clone();
+        move |_| {
+            if let Some(explorer) = explorer.upgrade() {
+                let selected = explorer.selection.selection();
+                if selected.size() > 0 {
+                    explorer.activate(selected.minimum());
+                }
+            }
+            popover.popdown();
+        }
+    });
+    let context_click = gtk::GestureClick::new();
+    context_click.set_button(3);
+    context_click.connect_pressed({
+        let popover = popover.clone();
+        move |_, _, x, y| {
+            popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            popover.popup();
+        }
+    });
+    grid.add_controller(context_click);
     explorer.directory.connect_error_notify({
         let explorer = Rc::downgrade(&explorer);
         move |directory| {
@@ -301,6 +321,26 @@ impl Explorer {
         };
         self.back.borrow_mut().push(self.current.borrow().clone());
         self.navigate(target, false);
+    }
+
+    fn activate(self: &Rc<Self>, position: u32) {
+        let Some(info) = self
+            .selection
+            .item(position)
+            .and_downcast::<gio::FileInfo>()
+        else {
+            return;
+        };
+        let child = self.current.borrow().child(info.name());
+        let file_type =
+            child.query_file_type(gio::FileQueryInfoFlags::NONE, gio::Cancellable::NONE);
+        if file_type == gio::FileType::Directory {
+            self.navigate(child, true);
+        } else if info.is_symlink() && file_type == gio::FileType::Unknown {
+            self.show_error("broken symbolic link");
+        } else {
+            self.launch(&child);
+        }
     }
 
     fn launch(&self, file: &gio::File) {
