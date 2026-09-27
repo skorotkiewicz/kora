@@ -19,8 +19,8 @@ fn main() -> ExitCode {
                 .ok_or_else(|| "no display is available".to_string())
                 .and_then(|display| desktop::detect_backend(&display))
                 .and_then(|backend| match backend {
-                    Backend::Wayland => desktop::create_wayland_view(app).map(|_| ()),
-                    Backend::X11 => desktop::create_x11_view(app, true).map(|_| ()),
+                    Backend::Wayland => desktop::create_wayland_views(app),
+                    Backend::X11 => desktop::create_x11_views(app, true),
                 });
 
             if let Err(error) = result {
