@@ -84,13 +84,15 @@ The bottom-right controls are:
 - **Current folder** icon: click to enter a path; drop files onto this button to target the current folder.
 - **Back**: appears when a previous folder is available.
 - **Show hidden files**: also controlled by Ctrl+H.
+- **More**: contains Operation results and Quit Kora.
 
-Right-click an icon for Open, Open with…, Rename, Copy, Cut, Paste, Move to Trash, Operation results, and Quit Kora. **Open with…** lets you choose an installed application for one selected item. Cancel closes the chooser without opening anything. **Open** keeps using the default application for files and opens folders within Kora. Select the intended files before using the context menu. Copy/Cut/Paste currently use Kora's internal clipboard, shared between its monitor views, not the system clipboard.
+Right-click an icon for Open, Open with…, Rename, Copy, Cut, Paste, Move to Trash, and Refresh. Refresh reloads the current folder without adding a navigation history entry. **Open with…** lets you choose an installed application for one selected item. Cancel closes the chooser without opening anything. **Open** keeps using the default application for files and opens folders within Kora. Select the intended files before using the context menu. Copy/Cut/Paste currently use Kora's internal clipboard, shared between its monitor views, not the system clipboard.
 
 | Key | Action |
 | --- | --- |
 | Enter | Open the selection |
 | F2 | Rename one selected entry |
+| F5 | Refresh the current folder |
 | Ctrl+C / Ctrl+X / Ctrl+V | Copy / cut / paste |
 | Delete | Ask for confirmation, then move to Trash |
 | Alt+Left / Alt+Right | Back / forward |
@@ -110,8 +112,8 @@ Scroll with the wheel or touchpad anywhere over the exposed desktop, including e
 - Cross-filesystem moves copy first, compare metadata for the source tree, then remove only checked entries. Detected source changes retain data and report failure. Cleanup can be partial; inspect both paths when an error is reported.
 - Do not move a tree while another application modifies it. Metadata checks are not a filesystem snapshot or a transaction against concurrent writers.
 - Trash uses the desktop Trash service only. If Trash is unavailable, Kora reports failure and keeps the item. There is no permanent-delete fallback.
-- Completed operations survive view removal in memory. **Operation results** shows up to 100 recent results; they are not saved across application restarts.
-- Quit Kora waits for queued operations. Forced termination, Ctrl+C, power loss, and crashes cannot provide that guarantee. Use Ctrl+Q or the context menu while operations are active.
+- Completed operations survive view removal in memory. **More → Operation results** shows up to 100 recent results; they are not saved across application restarts.
+- Quit Kora waits for queued operations. Forced termination, Ctrl+C, power loss, and crashes cannot provide that guarantee. Use Ctrl+Q or **More → Quit Kora** while operations are active.
 
 External drag-and-drop copy/move interoperability is still a release gate. Test with disposable files; do not assume every file manager implements source deletion the same way. Copy is the default when offered; Shift requests a move. Internal cut/paste is the simpler way to test cross-monitor moves.
 

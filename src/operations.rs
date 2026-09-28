@@ -731,11 +731,20 @@ mod tests {
         let source = root.join("tree");
         fs::create_dir(&source).unwrap();
         fs::write(source.join("child"), "before").unwrap();
-        let item = ExternalDragItem { path: source.clone(), fingerprint: fingerprint(&source).unwrap() };
+        let item = ExternalDragItem {
+            path: source.clone(),
+            fingerprint: fingerprint(&source).unwrap(),
+        };
         fs::write(source.join("child"), "after transfer").unwrap();
-        let result = execute(Request { id: 30, operation: Operation::FinishExternalMove { items: vec![item] } });
+        let result = execute(Request {
+            id: 30,
+            operation: Operation::FinishExternalMove { items: vec![item] },
+        });
         assert!(result.items[0].error.is_some());
-        assert_eq!(fs::read_to_string(source.join("child")).unwrap(), "after transfer");
+        assert_eq!(
+            fs::read_to_string(source.join("child")).unwrap(),
+            "after transfer"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -746,7 +755,10 @@ mod tests {
         let before = fingerprint(&root).unwrap();
         fs::write(root.join("not-copied"), "new content").unwrap();
         assert!(remove_verified_entries(&root, &before).is_err());
-        assert_eq!(fs::read_to_string(root.join("not-copied")).unwrap(), "new content");
+        assert_eq!(
+            fs::read_to_string(root.join("not-copied")).unwrap(),
+            "new content"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -760,8 +772,14 @@ mod tests {
         std::os::unix::fs::symlink("missing", source.join("broken")).unwrap();
         cross_filesystem_move(&source, &destination, || {}).unwrap();
         assert!(!source.exists());
-        assert_eq!(fs::read_to_string(destination.join("nested/file")).unwrap(), "content");
-        assert_eq!(fs::read_link(destination.join("broken")).unwrap(), PathBuf::from("missing"));
+        assert_eq!(
+            fs::read_to_string(destination.join("nested/file")).unwrap(),
+            "content"
+        );
+        assert_eq!(
+            fs::read_link(destination.join("broken")).unwrap(),
+            PathBuf::from("missing")
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -972,11 +990,17 @@ mod tests {
         let renamed = root.join("renamed");
         let result = execute(Request {
             id: 22,
-            operation: Operation::Move { sources: vec![renamed.clone()], destination: destination.clone() },
+            operation: Operation::Move {
+                sources: vec![renamed.clone()],
+                destination: destination.clone(),
+            },
         });
         assert!(result.items[0].error.is_none());
         assert!(fs::symlink_metadata(renamed).is_err());
-        assert_eq!(fs::read_link(destination.join("renamed")).unwrap(), PathBuf::from("missing"));
+        assert_eq!(
+            fs::read_link(destination.join("renamed")).unwrap(),
+            PathBuf::from("missing")
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -986,9 +1010,22 @@ mod tests {
         let source = root.join("file");
         fs::write(&source, "content").unwrap();
         for name in ["", ".", "..", "/", "a/b", "./name", "name/", "name/."] {
-            assert!(validate(Operation::Rename { source: source.clone(), new_name: name.into() }).is_err(), "accepted {name:?}");
+            assert!(
+                validate(Operation::Rename {
+                    source: source.clone(),
+                    new_name: name.into()
+                })
+                .is_err(),
+                "accepted {name:?}"
+            );
         }
-        assert!(validate(Operation::Rename { source: source.clone(), new_name: "valid name".into() }).is_ok());
+        assert!(
+            validate(Operation::Rename {
+                source: source.clone(),
+                new_name: "valid name".into()
+            })
+            .is_ok()
+        );
         assert_eq!(fs::read_to_string(source).unwrap(), "content");
         fs::remove_dir_all(root).unwrap();
     }

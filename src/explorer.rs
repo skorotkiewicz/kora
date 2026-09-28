@@ -544,31 +544,57 @@ pub fn view(start: PathBuf, home: PathBuf, icon_size: i32, operations: Rc<Operat
     let cut = gtk::Button::with_label("Cut");
     let paste = gtk::Button::with_label("Paste");
     let trash = gtk::Button::with_label("Move to Trash");
+    let refresh = gtk::Button::with_label("Refresh");
+    refresh.set_tooltip_text(Some("Reload the current folder (F5)"));
     let results = gtk::Button::with_label("Operation results");
     let quit = gtk::Button::with_label("Quit Kora");
+    let more_menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let more_popover = gtk::Popover::new();
+    more_popover.set_accessible_role(gtk::AccessibleRole::Menu);
+    more_popover.set_has_arrow(false);
+    more_popover.add_css_class("kora-menu");
+    more_popover.set_child(Some(&more_menu));
+    let more = gtk::MenuButton::builder()
+        .icon_name("view-more-symbolic")
+        .tooltip_text("More")
+        .popover(&more_popover)
+        .build();
+    more.update_property(&[gtk::accessible::Property::Label("More")]);
+    controls.append(&more);
     for button in [
-        &open, &open_with, &rename, &copy, &cut, &paste, &trash, &results, &quit,
+        &open, &open_with, &rename, &copy, &cut, &paste, &trash, &refresh, &results, &quit,
     ] {
         button.set_accessible_role(gtk::AccessibleRole::MenuItem);
         button.add_css_class("flat");
         if let Some(label) = button.child().and_downcast::<gtk::Label>() {
             label.set_xalign(0.0);
         }
-        if button == &copy || button == &results {
+        if button == &copy || button == &refresh {
             menu.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         }
-        menu.append(button);
+        if button == &results || button == &quit {
+            more_menu.append(button);
+        } else {
+            menu.append(button);
+        }
     }
     popover.set_child(Some(&menu));
-    results.connect_clicked(with_explorer(&explorer, {
+    refresh.connect_clicked(with_explorer(&explorer, {
         let popover = popover.clone();
+        move |explorer| {
+            popover.popdown();
+            explorer.refresh();
+        }
+    }));
+    results.connect_clicked(with_explorer(&explorer, {
+        let popover = more_popover.clone();
         move |explorer| {
             popover.popdown();
             explorer.show_results();
         }
     }));
     quit.connect_clicked(with_explorer(&explorer, {
-        let popover = popover.clone();
+        let popover = more_popover.clone();
         move |explorer| {
             popover.popdown();
             explorer.confirm_quit();
@@ -662,6 +688,9 @@ pub fn view(start: PathBuf, home: PathBuf, icon_size: i32, operations: Rc<Operat
             {
                 explorer.path_entry.set_visible(false);
                 grid.grab_focus();
+                true
+            } else if key == gtk::gdk::Key::F5 {
+                explorer.refresh();
                 true
             } else if key == gtk::gdk::Key::F2 {
                 explorer.show_rename();
@@ -762,6 +791,7 @@ pub fn view(start: PathBuf, home: PathBuf, icon_size: i32, operations: Rc<Operat
             back_button.upcast(),
             hidden_toggle.upcast(),
             folder_button.upcast(),
+            more.upcast(),
         ],
         #[cfg(test)]
         scroller,
@@ -784,6 +814,13 @@ where
 }
 
 impl Explorer {
+    fn refresh(self: &Rc<Self>) {
+        let current = self.current.borrow().clone();
+        // Setting the same file again is a no-op; clear it to force a fresh listing.
+        self.directory.set_file(gio::File::NONE);
+        self.navigate(current, false);
+    }
+
     fn navigate(self: &Rc<Self>, target: gio::File, save_history: bool) {
         let Some(path) = target.path() else {
             self.show_error("only local folders are supported");
@@ -1318,6 +1355,52 @@ mod tests {
             .selection
             .select_item(position("src").unwrap(), false);
         assert!(explorer.open_with_dialog().is_none());
+
+        let more = view.input_widgets[5]
+            .clone()
+            .downcast::<gtk::MenuButton>()
+            .unwrap();
+        let more_menu = more.popover().unwrap().child().unwrap();
+        assert_eq!(
+            more_menu
+                .first_child()
+                .unwrap()
+                .downcast::<gtk::Button>()
+                .unwrap()
+                .label()
+                .as_deref(),
+            Some("Operation results")
+        );
+        assert_eq!(
+            more_menu
+                .last_child()
+                .unwrap()
+                .downcast::<gtk::Button>()
+                .unwrap()
+                .label()
+                .as_deref(),
+            Some("Quit Kora")
+        );
+
+        let directory = temp_path("refresh");
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("before"), "before").unwrap();
+        explorer.navigate(gio::File::for_path(&directory), true);
+        wait(&|| !explorer.directory.is_loading() && position("before").is_some());
+        explorer.directory.set_monitored(false);
+        let back_before = explorer.back.borrow().clone();
+        let forward_before = explorer.forward.borrow().clone();
+        fs::write(directory.join("after"), "after").unwrap();
+        fs::write(directory.join(".hidden"), "hidden").unwrap();
+        assert!(position("after").is_none());
+        explorer.refresh();
+        wait(&|| !explorer.directory.is_loading() && position("after").is_some());
+        assert!(position(".hidden").is_none());
+        assert_eq!(explorer.current.borrow().path().unwrap(), directory);
+        assert_eq!(*explorer.back.borrow(), back_before);
+        assert_eq!(*explorer.forward.borrow(), forward_before);
+        explorer.directory.set_file(gio::File::NONE);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
