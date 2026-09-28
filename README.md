@@ -77,7 +77,7 @@ Neither mode edits wallpaper settings or stops a wallpaper provider.
 
 ## Desktop controls
 
-Icons fill the monitor instead of sitting inside a file-manager panel. Click selects; double-click opens. Ctrl/Shift-click supports multiple selections. Folders open within Kora. Filenames use a single line of shadowed text. Long names shorten in the middle; hover to see the full name.
+Icons fill the monitor instead of sitting inside a file-manager panel. Click selects; double-click opens. Ctrl/Shift-click supports multiple selections. Folders open within Kora. Filenames use a single line of shadowed text. Long names shorten in the middle; hover to see the full name. Selection highlights the icon and filename separately, without filling the grid cell.
 
 The bottom-right controls are:
 
@@ -100,7 +100,7 @@ Right-click an icon for Open, Rename, Copy, Cut, Paste, Move to Trash, Operation
 | Ctrl+H | Toggle hidden files |
 | Ctrl+Q | Confirm a safe quit of the whole application |
 
-Blank wallpaper passes pointer input through. It cannot also be a Kora drop target, context-menu surface, or starting area for rubber-band selection. Use folder icons or the current-folder button for drops. Ctrl/Shift-click selection remains available.
+Scroll with the wheel or touchpad anywhere over the exposed desktop, including empty space. Kora receives pointer input across the monitor, so blank wallpaper is no longer click-through. Normal application windows and panels above Kora retain input priority. Drag from empty grid space for rubber-band selection, or use Ctrl/Shift-click. File drops still target folder icons or the current-folder button.
 
 ## File safety
 

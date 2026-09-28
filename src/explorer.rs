@@ -71,12 +71,14 @@ struct Explorer {
     back_button: gtk::Button,
 }
 
-#[derive(Clone)]
 pub struct View {
     pub root: gtk::Overlay,
+    #[cfg(test)]
     pub grid: gtk::GridView,
-    pub tiles: gio::ListStore,
+    #[cfg(test)]
     pub input_widgets: Vec<gtk::Widget>,
+    #[cfg(test)]
+    pub scroller: gtk::ScrolledWindow,
     pub notifications: gtk::Box,
 }
 
@@ -185,11 +187,9 @@ pub fn view(start: PathBuf, home: PathBuf, icon_size: i32, operations: Rc<Operat
     let sorted = gtk::SortListModel::new(Some(filtered), Some(sorter));
     let selection = gtk::MultiSelection::new(Some(sorted));
     let explorer_slot = Rc::new(RefCell::new(std::rc::Weak::<Explorer>::new()));
-    let tiles = gio::ListStore::new::<gtk::Widget>();
     let factory = gtk::SignalListItemFactory::new();
     factory.connect_setup({
         let explorer_slot = explorer_slot.clone();
-        let tiles = tiles.clone();
         move |_, item| {
             let item = item.downcast_ref::<gtk::ListItem>().unwrap();
             let tile = gtk::Box::new(gtk::Orientation::Vertical, 4);
@@ -198,12 +198,12 @@ pub fn view(start: PathBuf, home: PathBuf, icon_size: i32, operations: Rc<Operat
             tile.set_accessible_role(gtk::AccessibleRole::ListItem);
             let image = gtk::Image::new();
             image.set_pixel_size(icon_size);
+            image.set_halign(gtk::Align::Center);
             tile.append(&image);
             let label = gtk::Label::new(None);
             label.set_single_line_mode(true);
             label.set_justify(gtk::Justification::Center);
             label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-            label.set_width_chars(10);
             label.set_max_width_chars(10);
             label.set_halign(gtk::Align::Center);
             tile.append(&label);
@@ -328,23 +328,6 @@ pub fn view(start: PathBuf, home: PathBuf, icon_size: i32, operations: Rc<Operat
                 }
             });
             tile.add_controller(drag_source);
-            tile.connect_map({
-                let tiles = tiles.clone();
-                move |tile| {
-                    let tile = tile.clone().upcast::<gtk::Widget>();
-                    if tiles.find(&tile).is_none() {
-                        tiles.append(&tile);
-                    }
-                }
-            });
-            tile.connect_unmap({
-                let tiles = tiles.clone();
-                move |tile| {
-                    if let Some(position) = tiles.find(tile) {
-                        tiles.remove(position);
-                    }
-                }
-            });
             item.set_child(Some(&tile));
         }
     });
@@ -367,14 +350,16 @@ pub fn view(start: PathBuf, home: PathBuf, icon_size: i32, operations: Rc<Operat
     grid.set_min_columns(1);
     grid.set_max_columns(32);
     grid.set_enable_rubberband(true);
+    grid.set_margin_top(16);
+    grid.set_margin_bottom(16);
+    grid.set_margin_start(16);
+    grid.set_margin_end(16);
+    // Let the native scroller receive wheel and touchpad input over empty space too.
     let scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
+        .kinetic_scrolling(true)
         .vexpand(true)
         .hexpand(true)
-        .margin_top(16)
-        .margin_bottom(16)
-        .margin_start(16)
-        .margin_end(16)
         .child(&grid)
         .build();
     root.set_child(Some(&scroller));
@@ -753,8 +738,9 @@ pub fn view(start: PathBuf, home: PathBuf, icon_size: i32, operations: Rc<Operat
 
     View {
         root,
+        #[cfg(test)]
         grid,
-        tiles,
+        #[cfg(test)]
         input_widgets: vec![
             path_entry.upcast(),
             recovery.upcast(),
@@ -762,6 +748,8 @@ pub fn view(start: PathBuf, home: PathBuf, icon_size: i32, operations: Rc<Operat
             hidden_toggle.upcast(),
             folder_button.upcast(),
         ],
+        #[cfg(test)]
+        scroller,
         notifications,
     }
 }
@@ -1208,6 +1196,12 @@ mod tests {
         app.register(gio::Cancellable::NONE).unwrap();
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let view = view(root.clone(), root, 48, OperationQueue::new(&app));
+        assert!(view.scroller.is_kinetic_scrolling());
+        assert!(view.scroller.hexpands() && view.scroller.vexpands());
+        assert_eq!(view.scroller.margin_top(), 0);
+        assert_eq!(view.scroller.margin_bottom(), 0);
+        assert_eq!(view.scroller.margin_start(), 0);
+        assert_eq!(view.scroller.margin_end(), 0);
         let model = view.grid.model().unwrap();
         let back = view.input_widgets[2]
             .clone()

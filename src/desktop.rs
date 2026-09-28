@@ -52,120 +52,6 @@ fn monitor_key(monitor: &gdk::Monitor, index: u32) -> String {
     )
 }
 
-fn add_widget_to_input_region(
-    region: &gtk::cairo::Region,
-    window: &gtk::ApplicationWindow,
-    widget: &gtk::Widget,
-) {
-    if !widget.is_mapped() {
-        return;
-    }
-    let Some(bounds) = widget.compute_bounds(window) else {
-        return;
-    };
-    let x = bounds.x().floor() as i32;
-    let y = bounds.y().floor() as i32;
-    let width = bounds.width().ceil() as i32;
-    let height = bounds.height().ceil() as i32;
-    if width > 0 && height > 0 {
-        let _ = region.union_rectangle(&gtk::cairo::RectangleInt::new(x, y, width, height));
-    }
-}
-
-fn set_desktop_input_region(window: &gtk::ApplicationWindow, view: &explorer::View) {
-    let Some(surface) = window.surface() else {
-        return;
-    };
-    let region = gtk::cairo::Region::create();
-    for index in 0..view.tiles.n_items() {
-        if let Some(tile) = view.tiles.item(index).and_downcast::<gtk::Widget>() {
-            add_widget_to_input_region(&region, window, &tile);
-        }
-    }
-    for widget in &view.input_widgets {
-        add_widget_to_input_region(&region, window, widget);
-    }
-    surface.set_input_region(&region);
-    // Wayland commits the changed input region on the next frame.
-    surface.queue_render();
-}
-
-fn queue_desktop_input_region(
-    window: &gtk::ApplicationWindow,
-    view: &explorer::View,
-    pending: &Rc<std::cell::Cell<bool>>,
-) {
-    if pending.replace(true) {
-        return;
-    }
-    let window = window.clone();
-    let view = view.clone();
-    let pending = pending.clone();
-    let grid = view.grid.clone();
-    grid.add_tick_callback(move |_, _| {
-        glib::idle_add_local_once({
-            let window = window.clone();
-            let view = view.clone();
-            let pending = pending.clone();
-            move || {
-                set_desktop_input_region(&window, &view);
-                pending.set(false);
-            }
-        });
-        glib::ControlFlow::Break
-    });
-}
-
-fn install_desktop_input_region(window: &gtk::ApplicationWindow, view: &explorer::View) {
-    let pending = Rc::new(std::cell::Cell::new(false));
-    view.tiles.connect_items_changed({
-        let window = window.clone();
-        let view = view.clone();
-        let pending = pending.clone();
-        move |_, _, _, _| queue_desktop_input_region(&window, &view, &pending)
-    });
-    if let Some(model) = view.grid.model() {
-        model.connect_items_changed({
-            let window = window.clone();
-            let view = view.clone();
-            let pending = pending.clone();
-            move |_, _, _, _| queue_desktop_input_region(&window, &view, &pending)
-        });
-    }
-    for property in ["width", "height"] {
-        view.grid.connect_notify_local(Some(property), {
-            let window = window.clone();
-            let view = view.clone();
-            let pending = pending.clone();
-            move |_, _| queue_desktop_input_region(&window, &view, &pending)
-        });
-    }
-    if let Some(scroller) = view.grid.ancestor(gtk::ScrolledWindow::static_type()) {
-        let scroller = scroller.downcast::<gtk::ScrolledWindow>().unwrap();
-        scroller.vadjustment().connect_value_changed({
-            let window = window.clone();
-            let view = view.clone();
-            let pending = pending.clone();
-            move |_| queue_desktop_input_region(&window, &view, &pending)
-        });
-    }
-    for widget in &view.input_widgets {
-        widget.connect_notify_local(Some("visible"), {
-            let window = window.clone();
-            let view = view.clone();
-            let pending = pending.clone();
-            move |_, _| queue_desktop_input_region(&window, &view, &pending)
-        });
-    }
-    window.connect_notify_local(Some("scale-factor"), {
-        let window = window.clone();
-        let view = view.clone();
-        let pending = pending.clone();
-        move |_, _| queue_desktop_input_region(&window, &view, &pending)
-    });
-    queue_desktop_input_region(window, view, &pending);
-}
-
 fn install_safe_close(window: &gtk::ApplicationWindow, operations: &Rc<OperationQueue>) {
     window.connect_close_request({
         let operations = operations.clone();
@@ -190,9 +76,24 @@ fn make_window_transparent(window: &gtk::ApplicationWindow) {
     provider.load_from_data(
         ".kora-window, .kora-desktop, .kora-desktop scrolledwindow, \
          .kora-desktop viewport, .kora-desktop gridview { background-color: transparent; }\n\
-         .kora-desktop gridview > child { border-radius: 6px; padding: 4px; }\n\
-         .kora-file label { color: white;\n\
-             text-shadow: 1px 1px 2px black, 0 0 3px black; }\n\
+         .kora-desktop gridview > child,\n\
+         .kora-desktop gridview > child:hover,\n\
+         .kora-desktop gridview > child:selected,\n\
+         .kora-desktop gridview > child:focus { background-color: transparent;\n\
+             background-image: none; box-shadow: none; outline: none; padding: 4px; }\n\
+         .kora-file image { padding: 6px; border-radius: 8px;\n\
+             transition: background-color 120ms ease-out; }\n\
+         .kora-file label { color: white; border-radius: 4px; padding: 2px 4px;\n\
+             text-shadow: 1px 1px 2px black, 0 0 3px black;\n\
+             transition: background-color 120ms ease-out; }\n\
+         .kora-desktop gridview > child:selected .kora-file image {\n\
+             background-color: rgba(0,0,0,0.18);\n\
+             box-shadow: inset 0 0 0 1px rgba(255,255,255,0.55); }\n\
+         .kora-desktop gridview > child:selected .kora-file label {\n\
+             background-color: #2367b5; text-shadow: none; }\n\
+         .kora-desktop gridview > child:focus-visible .kora-file image {\n\
+             outline: 2px solid white; outline-offset: 2px;\n\
+             box-shadow: 0 0 0 3px rgba(0,0,0,0.55); }\n\
          .kora-menu button { min-height: 24px; padding: 2px 10px; }",
     );
     gtk::style_context_add_provider_for_display(
@@ -207,7 +108,7 @@ fn build_view(
     settings: &Settings,
     home: &std::path::Path,
     operations: Rc<OperationQueue>,
-) -> (gtk::Overlay, explorer::View) {
+) -> gtk::Overlay {
     let root = gtk::Overlay::new();
     let background = gtk::DrawingArea::new();
     if settings.wallpaper_mode == WallpaperMode::Replace {
@@ -252,7 +153,7 @@ fn build_view(
         }
     }
     root.add_overlay(&view.root);
-    (root, view)
+    root
 }
 
 fn validate_wayland_capabilities(supported: bool, version: u32) -> Result<(), String> {
@@ -291,10 +192,9 @@ fn create_wayland_view(
     window.set_keyboard_mode(KeyboardMode::OnDemand);
 
     install_safe_close(&window, &operations);
-    let (content, view) = build_view(&settings, config.home(), operations);
+    let content = build_view(&settings, config.home(), operations);
     window.set_child(Some(&content));
     window.set_visible(true);
-    install_desktop_input_region(&window, &view);
 
     Ok(window)
 }
@@ -427,7 +327,7 @@ fn create_x11_view(
         .build();
     make_window_transparent(&window);
     install_safe_close(&window, &operations);
-    let (content, view) = build_view(&settings, config.home(), operations);
+    let content = build_view(&settings, config.home(), operations);
     window.set_child(Some(&content));
     gtk::prelude::WidgetExt::realize(&window);
 
@@ -448,7 +348,7 @@ fn create_x11_view(
         }
         glib::Propagation::Proceed
     });
-    view.root.add_controller(focus);
+    content.add_controller(focus);
     let window_type = atom(&connection, "_NET_WM_WINDOW_TYPE")?;
     let desktop_type = atom(&connection, "_NET_WM_WINDOW_TYPE_DESKTOP")?;
     let window_state = atom(&connection, "_NET_WM_STATE")?;
@@ -502,7 +402,6 @@ fn create_x11_view(
         .map_err(|error| error.to_string())?;
     connection.flush().map_err(|error| error.to_string())?;
     window.set_visible(true);
-    install_desktop_input_region(&window, &view);
     monitor.connect_notify_local(Some("geometry"), move |monitor, _| {
         let Ok((connection, _)) = x11rb::connect(None) else {
             return;
