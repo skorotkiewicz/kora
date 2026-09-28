@@ -79,6 +79,8 @@ pub struct View {
     pub input_widgets: Vec<gtk::Widget>,
     #[cfg(test)]
     pub scroller: gtk::ScrolledWindow,
+    #[cfg(test)]
+    explorer: Rc<Explorer>,
     pub notifications: gtk::Box,
 }
 
@@ -536,6 +538,7 @@ pub fn view(start: PathBuf, home: PathBuf, icon_size: i32, operations: Rc<Operat
     popover.add_css_class("kora-menu");
     let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let open = gtk::Button::with_label("Open");
+    let open_with = gtk::Button::with_label("Open with…");
     let rename = gtk::Button::with_label("Rename");
     let copy = gtk::Button::with_label("Copy");
     let cut = gtk::Button::with_label("Cut");
@@ -543,7 +546,9 @@ pub fn view(start: PathBuf, home: PathBuf, icon_size: i32, operations: Rc<Operat
     let trash = gtk::Button::with_label("Move to Trash");
     let results = gtk::Button::with_label("Operation results");
     let quit = gtk::Button::with_label("Quit Kora");
-    for button in [&open, &rename, &copy, &cut, &paste, &trash, &results, &quit] {
+    for button in [
+        &open, &open_with, &rename, &copy, &cut, &paste, &trash, &results, &quit,
+    ] {
         button.set_accessible_role(gtk::AccessibleRole::MenuItem);
         button.add_css_class("flat");
         if let Some(label) = button.child().and_downcast::<gtk::Label>() {
@@ -582,6 +587,15 @@ pub fn view(start: PathBuf, home: PathBuf, icon_size: i32, operations: Rc<Operat
             popover.popdown();
         }
     });
+    open_with.connect_clicked(with_explorer(&explorer, {
+        let popover = popover.clone();
+        move |explorer| {
+            popover.popdown();
+            if let Some(dialog) = explorer.open_with_dialog() {
+                dialog.present();
+            }
+        }
+    }));
     rename.connect_clicked({
         let explorer = Rc::downgrade(&explorer);
         let popover = popover.clone();
@@ -706,6 +720,7 @@ pub fn view(start: PathBuf, home: PathBuf, icon_size: i32, operations: Rc<Operat
             };
             let selected = explorer.selection.selection().size();
             open.set_sensitive(selected > 0);
+            open_with.set_sensitive(selected == 1);
             rename.set_sensitive(selected == 1);
             copy.set_sensitive(selected > 0);
             cut.set_sensitive(selected > 0);
@@ -750,6 +765,8 @@ pub fn view(start: PathBuf, home: PathBuf, icon_size: i32, operations: Rc<Operat
         ],
         #[cfg(test)]
         scroller,
+        #[cfg(test)]
+        explorer,
         notifications,
     }
 }
@@ -1131,6 +1148,46 @@ impl Explorer {
         dialog.present();
     }
 
+    fn open_with_dialog(self: &Rc<Self>) -> Option<gtk::AppChooserDialog> {
+        let paths = self.selected_paths();
+        let [path] = paths.as_slice() else {
+            self.show_operation_error("select exactly one item to open with another application");
+            return None;
+        };
+        let file = gio::File::for_path(path);
+        let parent = self.path_entry.root().and_downcast::<gtk::Window>();
+        let dialog = gtk::AppChooserDialog::new(
+            parent.as_ref(),
+            gtk::DialogFlags::MODAL | gtk::DialogFlags::DESTROY_WITH_PARENT,
+            &file,
+        );
+        dialog.set_title(Some("Open with"));
+        dialog.connect_response({
+            let explorer = Rc::downgrade(self);
+            move |dialog, response| {
+                if response == gtk::ResponseType::Ok
+                    && let Some(explorer) = explorer.upgrade()
+                {
+                    if let Some(app) = dialog.app_info() {
+                        let context = gtk::prelude::WidgetExt::display(dialog).app_launch_context();
+                        if let Err(error) = app.launch(std::slice::from_ref(&file), Some(&context))
+                        {
+                            explorer.show_operation_error(&format!(
+                                "cannot open {} with {}: {error}",
+                                file.parse_name(),
+                                app.display_name(),
+                            ));
+                        }
+                    } else {
+                        explorer.show_operation_error("no application was selected");
+                    }
+                }
+                dialog.close();
+            }
+        });
+        Some(dialog)
+    }
+
     fn launch(&self, file: &gio::File) {
         if let Err(error) =
             gio::AppInfo::launch_default_for_uri(&file.uri(), gio::AppLaunchContext::NONE)
@@ -1241,6 +1298,26 @@ mod tests {
         wait(&|| back.is_visible() && position("desktop.rs").is_some());
         back.emit_clicked();
         wait(&|| !back.is_visible() && position("Cargo.toml").is_some());
+
+        // Exercise chooser selection and cancellation without showing a window or launching an app.
+        let explorer = &view.explorer;
+        explorer.selection.unselect_all();
+        assert!(explorer.open_with_dialog().is_none());
+        explorer
+            .selection
+            .select_item(position("Cargo.toml").unwrap(), true);
+        let dialog = explorer.open_with_dialog().unwrap();
+        assert_eq!(
+            dialog.gfile().unwrap(),
+            explorer.current.borrow().child("Cargo.toml")
+        );
+        let previous_error = explorer.error_label.text();
+        dialog.response(gtk::ResponseType::Cancel);
+        assert_eq!(explorer.error_label.text(), previous_error);
+        explorer
+            .selection
+            .select_item(position("src").unwrap(), false);
+        assert!(explorer.open_with_dialog().is_none());
     }
 
     #[test]

@@ -85,7 +85,7 @@ The bottom-right controls are:
 - **Back**: appears when a previous folder is available.
 - **Show hidden files**: also controlled by Ctrl+H.
 
-Right-click an icon for Open, Rename, Copy, Cut, Paste, Move to Trash, Operation results, and Quit Kora. Select the intended files before using the context menu. Copy/Cut/Paste currently use Kora's internal clipboard, shared between its monitor views, not the system clipboard.
+Right-click an icon for Open, Open with…, Rename, Copy, Cut, Paste, Move to Trash, Operation results, and Quit Kora. **Open with…** lets you choose an installed application for one selected item. Cancel closes the chooser without opening anything. **Open** keeps using the default application for files and opens folders within Kora. Select the intended files before using the context menu. Copy/Cut/Paste currently use Kora's internal clipboard, shared between its monitor views, not the system clipboard.
 
 | Key | Action |
 | --- | --- |
