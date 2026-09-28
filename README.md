@@ -52,6 +52,7 @@ Use [config.example.toml](config.example.toml) as a starting point. Change its f
 path = "~/Desktop"
 wallpaper_mode = "transparent"
 background_color = "#202020"
+icon_size = 48
 
 [monitors."DP-1"]
 path = "~/Projects"
@@ -72,9 +73,11 @@ Monitor settings inherit omitted fields from `[defaults]`. An empty `wallpaper_i
 
 Neither mode edits wallpaper settings or stops a wallpaper provider.
 
+`icon_size` sets the file icons' size in logical pixels, from 24 to 128. The default is 48; try 64 or 96 for larger icons. Set it in `[defaults]` or override it per monitor. GTK applies display scaling automatically. Restart Kora after changing it.
+
 ## Desktop controls
 
-Icons fill the monitor instead of sitting inside a file-manager panel. Click selects; double-click opens. Ctrl/Shift-click supports multiple selections. Folders open within Kora.
+Icons fill the monitor instead of sitting inside a file-manager panel. Click selects; double-click opens. Ctrl/Shift-click supports multiple selections. Folders open within Kora. Filenames use up to two lines on a dark backing for contrast; hover to see the full name.
 
 The bottom-right controls are:
 

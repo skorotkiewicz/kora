@@ -189,7 +189,11 @@ fn make_window_transparent(window: &gtk::ApplicationWindow) {
     let provider = gtk::CssProvider::new();
     provider.load_from_data(
         ".kora-window, .kora-desktop, .kora-desktop scrolledwindow, \
-         .kora-desktop viewport, .kora-desktop gridview { background-color: transparent; }",
+         .kora-desktop viewport, .kora-desktop gridview { background-color: transparent; }\n\
+         .kora-desktop gridview > child { border-radius: 8px; padding: 6px; }\n\
+         .kora-file label { color: white; background-color: rgba(0,0,0,0.6);\n\
+             text-shadow: 0 1px 2px black; border-radius: 4px; padding: 2px 4px; }\n\
+         .kora-menu button { min-height: 24px; padding: 2px 10px; }",
     );
     gtk::style_context_add_provider_for_display(
         &gtk::prelude::WidgetExt::display(window),
@@ -221,7 +225,12 @@ fn build_view(
     }
     root.set_child(Some(&background));
 
-    let view = explorer::view(settings.path.clone(), home.to_path_buf(), operations);
+    let view = explorer::view(
+        settings.path.clone(),
+        home.to_path_buf(),
+        settings.icon_size,
+        operations,
+    );
 
     if settings.wallpaper_mode == WallpaperMode::Replace
         && let Some(path) = &settings.wallpaper_image

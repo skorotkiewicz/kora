@@ -80,7 +80,7 @@ pub struct View {
     pub notifications: gtk::Box,
 }
 
-pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> View {
+pub fn view(start: PathBuf, home: PathBuf, icon_size: i32, operations: Rc<OperationQueue>) -> View {
     let root = gtk::Overlay::builder().hexpand(true).vexpand(true).build();
     root.add_css_class("kora-desktop");
 
@@ -193,12 +193,21 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> Vi
         move |_, item| {
             let item = item.downcast_ref::<gtk::ListItem>().unwrap();
             let tile = gtk::Box::new(gtk::Orientation::Vertical, 4);
-            tile.set_size_request(96, 80);
+            tile.set_size_request((icon_size + 24).max(104), icon_size + 52);
+            tile.add_css_class("kora-file");
             tile.set_accessible_role(gtk::AccessibleRole::ListItem);
-            tile.append(&gtk::Image::new());
+            let image = gtk::Image::new();
+            image.set_pixel_size(icon_size);
+            tile.append(&image);
             let label = gtk::Label::new(None);
+            label.set_wrap(true);
+            label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+            label.set_lines(2);
+            label.set_justify(gtk::Justification::Center);
             label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            label.set_width_chars(14);
             label.set_max_width_chars(14);
+            label.set_halign(gtk::Align::Center);
             tile.append(&label);
             let context_selection = gtk::EventControllerLegacy::builder()
                 .propagation_phase(gtk::PropagationPhase::Capture)
@@ -353,6 +362,7 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> Vi
             image.clear();
         }
         label.set_label(&info.display_name());
+        tile.set_tooltip_text(Some(&info.display_name()));
         tile.update_property(&[gtk::accessible::Property::Label(&info.display_name())]);
     });
     let grid = gtk::GridView::new(Some(selection.clone()), Some(factory));
@@ -539,6 +549,8 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> Vi
     let popover = gtk::Popover::new();
     popover.set_parent(&grid);
     popover.set_accessible_role(gtk::AccessibleRole::Menu);
+    popover.set_has_arrow(false);
+    popover.add_css_class("kora-menu");
     let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let open = gtk::Button::with_label("Open");
     let rename = gtk::Button::with_label("Rename");
@@ -550,6 +562,13 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> Vi
     let quit = gtk::Button::with_label("Quit Kora");
     for button in [&open, &rename, &copy, &cut, &paste, &trash, &results, &quit] {
         button.set_accessible_role(gtk::AccessibleRole::MenuItem);
+        button.add_css_class("flat");
+        if let Some(label) = button.child().and_downcast::<gtk::Label>() {
+            label.set_xalign(0.0);
+        }
+        if button == &copy || button == &results {
+            menu.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        }
         menu.append(button);
     }
     popover.set_child(Some(&menu));
@@ -697,7 +716,23 @@ pub fn view(start: PathBuf, home: PathBuf, operations: Rc<OperationQueue>) -> Vi
     context_click.set_button(3);
     context_click.connect_pressed({
         let popover = popover.clone();
+        let explorer = Rc::downgrade(&explorer);
         move |_, _, x, y| {
+            let Some(explorer) = explorer.upgrade() else {
+                return;
+            };
+            let selected = explorer.selection.selection().size();
+            open.set_sensitive(selected > 0);
+            rename.set_sensitive(selected == 1);
+            copy.set_sensitive(selected > 0);
+            cut.set_sensitive(selected > 0);
+            trash.set_sensitive(selected > 0);
+            paste.set_sensitive(
+                explorer
+                    .operations
+                    .clipboard()
+                    .is_some_and(|(_, paths)| !paths.is_empty()),
+            );
             popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
             popover.popup();
         }
@@ -1174,7 +1209,7 @@ mod tests {
             .build();
         app.register(gio::Cancellable::NONE).unwrap();
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let view = view(root.clone(), root, OperationQueue::new(&app));
+        let view = view(root.clone(), root, 48, OperationQueue::new(&app));
         let model = view.grid.model().unwrap();
         let back = view.input_widgets[2]
             .clone()

@@ -2,9 +2,13 @@
 path = "~/Desktop"
 wallpaper_mode = "transparent"
 background_color = "#202020"
+# Logical pixels, 24 to 128. GTK handles display scaling.
+icon_size = 48
 
 [monitors."DP-1"]
 path = "~/Projects"
+# Optional larger icons on this output.
+icon_size = 64
 wallpaper_mode = "replace"
 wallpaper_image = "~/Pictures/wallpaper.jpg"
 

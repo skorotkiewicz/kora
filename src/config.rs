@@ -16,6 +16,7 @@ pub struct Settings {
     pub wallpaper_mode: WallpaperMode,
     pub wallpaper_image: Option<PathBuf>,
     pub background_color: String,
+    pub icon_size: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +32,7 @@ struct PartialSettings {
     wallpaper_mode: Option<WallpaperMode>,
     wallpaper_image: Option<Option<PathBuf>>,
     background_color: Option<String>,
+    icon_size: Option<i32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -49,6 +51,7 @@ struct RawSettings {
     wallpaper_mode: Option<WallpaperMode>,
     wallpaper_image: Option<String>,
     background_color: Option<String>,
+    icon_size: Option<i32>,
 }
 
 impl Config {
@@ -61,18 +64,7 @@ impl Config {
         let Some(overrides) = connector.and_then(|name| self.monitors.get(name)) else {
             return settings;
         };
-        if let Some(path) = &overrides.path {
-            settings.path = path.clone();
-        }
-        if let Some(mode) = overrides.wallpaper_mode {
-            settings.wallpaper_mode = mode;
-        }
-        if let Some(image) = &overrides.wallpaper_image {
-            settings.wallpaper_image = image.clone();
-        }
-        if let Some(color) = &overrides.background_color {
-            settings.background_color = color.clone();
-        }
+        apply(&mut settings, overrides);
         settings
     }
 }
@@ -146,6 +138,7 @@ fn default_config(home: &std::path::Path) -> Config {
             wallpaper_mode: WallpaperMode::Transparent,
             wallpaper_image: None,
             background_color: "#202020".into(),
+            icon_size: 48,
         },
         monitors: HashMap::new(),
     }
@@ -210,11 +203,19 @@ fn resolve_partial(
             "{context}.background_color must use #RRGGBB format"
         ));
     }
+    if let Some(size) = raw.icon_size
+        && !(24..=128).contains(&size)
+    {
+        return Err(format!(
+            "{context}.icon_size must be an integer from 24 to 128"
+        ));
+    }
     Ok(PartialSettings {
         path,
         wallpaper_mode: raw.wallpaper_mode,
         wallpaper_image,
         background_color: raw.background_color,
+        icon_size: raw.icon_size,
     })
 }
 
@@ -249,6 +250,9 @@ fn apply(settings: &mut Settings, overrides: &PartialSettings) {
     }
     if let Some(color) = &overrides.background_color {
         settings.background_color = color.clone();
+    }
+    if let Some(size) = overrides.icon_size {
+        settings.icon_size = size;
     }
 }
 
@@ -332,6 +336,51 @@ mod tests {
             settings.wallpaper_image,
             Some(home.join("config/images/$HOME;still-literal.png"))
         );
+    }
+
+    #[test]
+    fn icon_size_defaults_inherits_and_validates() {
+        let home = PathBuf::from("/home/test");
+        let path = home.join("config.toml");
+        assert_eq!(default_config(&home).effective(None).icon_size, 48);
+        assert_eq!(
+            parse("", &path, &home).unwrap().effective(None).icon_size,
+            48
+        );
+        let config = parse(
+            "[defaults]\nicon_size = 64\n[monitors.DP-1]\nicon_size = 96\n[monitors.HDMI-A-1]\npath = 'Desktop'",
+            &path, &home,
+        ).unwrap();
+        assert_eq!(config.effective(None).icon_size, 64);
+        assert_eq!(config.effective(Some("DP-1")).icon_size, 96);
+        assert_eq!(config.effective(Some("HDMI-A-1")).icon_size, 64);
+        assert_eq!(config.effective(Some("UNKNOWN")).icon_size, 64);
+        for size in [24, 48, 128] {
+            assert_eq!(
+                parse(&format!("[defaults]\nicon_size = {size}"), &path, &home)
+                    .unwrap()
+                    .effective(None)
+                    .icon_size,
+                size
+            );
+        }
+        for value in [
+            "0",
+            "23",
+            "129",
+            "-1",
+            "48.5",
+            "'large'",
+            "true",
+            "2147483648",
+        ] {
+            for section in ["defaults", "monitors.DP-1"] {
+                let error =
+                    parse(&format!("[{section}]\nicon_size = {value}"), &path, &home).unwrap_err();
+                assert!(error.contains("config.toml"));
+                assert!(error.contains("icon_size"));
+            }
+        }
     }
 
     #[test]
