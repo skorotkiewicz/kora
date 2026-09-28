@@ -193,20 +193,18 @@ pub fn view(start: PathBuf, home: PathBuf, icon_size: i32, operations: Rc<Operat
         move |_, item| {
             let item = item.downcast_ref::<gtk::ListItem>().unwrap();
             let tile = gtk::Box::new(gtk::Orientation::Vertical, 4);
-            tile.set_size_request((icon_size + 24).max(104), icon_size + 52);
+            tile.set_size_request((icon_size + 24).max(88), icon_size + 28);
             tile.add_css_class("kora-file");
             tile.set_accessible_role(gtk::AccessibleRole::ListItem);
             let image = gtk::Image::new();
             image.set_pixel_size(icon_size);
             tile.append(&image);
             let label = gtk::Label::new(None);
-            label.set_wrap(true);
-            label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-            label.set_lines(2);
+            label.set_single_line_mode(true);
             label.set_justify(gtk::Justification::Center);
-            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            label.set_width_chars(14);
-            label.set_max_width_chars(14);
+            label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+            label.set_width_chars(10);
+            label.set_max_width_chars(10);
             label.set_halign(gtk::Align::Center);
             tile.append(&label);
             let context_selection = gtk::EventControllerLegacy::builder()

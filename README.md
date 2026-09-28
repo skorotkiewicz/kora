@@ -77,7 +77,7 @@ Neither mode edits wallpaper settings or stops a wallpaper provider.
 
 ## Desktop controls
 
-Icons fill the monitor instead of sitting inside a file-manager panel. Click selects; double-click opens. Ctrl/Shift-click supports multiple selections. Folders open within Kora. Filenames use up to two lines on a dark backing for contrast; hover to see the full name.
+Icons fill the monitor instead of sitting inside a file-manager panel. Click selects; double-click opens. Ctrl/Shift-click supports multiple selections. Folders open within Kora. Filenames use a single line of shadowed text. Long names shorten in the middle; hover to see the full name.
 
 The bottom-right controls are:
 

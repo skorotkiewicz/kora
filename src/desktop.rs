@@ -190,9 +190,9 @@ fn make_window_transparent(window: &gtk::ApplicationWindow) {
     provider.load_from_data(
         ".kora-window, .kora-desktop, .kora-desktop scrolledwindow, \
          .kora-desktop viewport, .kora-desktop gridview { background-color: transparent; }\n\
-         .kora-desktop gridview > child { border-radius: 8px; padding: 6px; }\n\
-         .kora-file label { color: white; background-color: rgba(0,0,0,0.6);\n\
-             text-shadow: 0 1px 2px black; border-radius: 4px; padding: 2px 4px; }\n\
+         .kora-desktop gridview > child { border-radius: 6px; padding: 4px; }\n\
+         .kora-file label { color: white;\n\
+             text-shadow: 1px 1px 2px black, 0 0 3px black; }\n\
          .kora-menu button { min-height: 24px; padding: 2px 10px; }",
     );
     gtk::style_context_add_provider_for_display(
