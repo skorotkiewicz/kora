@@ -55,6 +55,14 @@ fn drag_provider(paths: &[PathBuf]) -> gtk::gdk::ContentProvider {
 #[cfg(test)]
 use std::{fs, path::Path};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Navigation {
+    Visit,
+    Reload,
+    Back,
+    Forward,
+}
+
 struct Explorer {
     current: RefCell<gio::File>,
     home: gio::File,
@@ -236,10 +244,13 @@ pub fn view(start: PathBuf, home: PathBuf, icon_size: i32, operations: Rc<Operat
             drop_target.set_preload(true);
             drop_target.set_propagation_phase(gtk::PropagationPhase::Capture);
             drop_target.connect_motion({
-                let item = item.clone();
+                let item = item.downgrade();
                 let explorer_slot = explorer_slot.clone();
                 move |target, _, _| {
                     let Some(explorer) = explorer_slot.borrow().upgrade() else {
+                        return gtk::gdk::DragAction::empty();
+                    };
+                    let Some(item) = item.upgrade() else {
                         return gtk::gdk::DragAction::empty();
                     };
                     let Some(destination) = explorer.folder_for_item(&item) else {
@@ -259,10 +270,13 @@ pub fn view(start: PathBuf, home: PathBuf, icon_size: i32, operations: Rc<Operat
                 }
             });
             drop_target.connect_drop({
-                let item = item.clone();
+                let item = item.downgrade();
                 let explorer_slot = explorer_slot.clone();
                 move |target, value, _, _| {
                     let Some(explorer) = explorer_slot.borrow().upgrade() else {
+                        return false;
+                    };
+                    let Some(item) = item.upgrade() else {
                         return false;
                     };
                     let Some(destination) = explorer.folder_for_item(&item) else {
@@ -495,7 +509,7 @@ pub fn view(start: PathBuf, home: PathBuf, icon_size: i32, operations: Rc<Operat
     });
     folder_button.add_controller(current_drop);
 
-    explorer.navigate(gio::File::for_path(start), false);
+    explorer.navigate(gio::File::for_path(start), Navigation::Reload);
 
     folder_button.connect_clicked(with_explorer(&explorer, |explorer| {
         explorer.path_entry.set_visible(true);
@@ -509,17 +523,20 @@ pub fn view(start: PathBuf, home: PathBuf, icon_size: i32, operations: Rc<Operat
         }
     }));
     retry_button.connect_clicked(with_explorer(&explorer, |explorer| {
-        explorer.navigate(explorer.current.borrow().clone(), false)
+        explorer.navigate(
+            gio::File::for_path(explorer.path_entry.text()),
+            Navigation::Reload,
+        )
     }));
     recovery_home_button.connect_clicked(with_explorer(&explorer, |explorer| {
-        explorer.navigate(explorer.home.clone(), true)
+        explorer.navigate(explorer.home.clone(), Navigation::Visit)
     }));
     explorer.path_entry.connect_activate({
         let explorer = Rc::downgrade(&explorer);
         move |entry| {
             if let Some(explorer) = explorer.upgrade() {
                 entry.set_visible(false);
-                explorer.navigate(gio::File::for_path(entry.text()), true);
+                explorer.navigate(gio::File::for_path(entry.text()), Navigation::Visit);
             }
         }
     });
@@ -580,29 +597,35 @@ pub fn view(start: PathBuf, home: PathBuf, icon_size: i32, operations: Rc<Operat
     }
     popover.set_child(Some(&menu));
     refresh.connect_clicked(with_explorer(&explorer, {
-        let popover = popover.clone();
+        let popover = popover.downgrade();
         move |explorer| {
-            popover.popdown();
+            if let Some(popover) = popover.upgrade() {
+                popover.popdown();
+            }
             explorer.refresh();
         }
     }));
     results.connect_clicked(with_explorer(&explorer, {
-        let popover = more_popover.clone();
+        let popover = more_popover.downgrade();
         move |explorer| {
-            popover.popdown();
+            if let Some(popover) = popover.upgrade() {
+                popover.popdown();
+            }
             explorer.show_results();
         }
     }));
     quit.connect_clicked(with_explorer(&explorer, {
-        let popover = more_popover.clone();
+        let popover = more_popover.downgrade();
         move |explorer| {
-            popover.popdown();
+            if let Some(popover) = popover.upgrade() {
+                popover.popdown();
+            }
             explorer.confirm_quit();
         }
     }));
     open.connect_clicked({
         let explorer = Rc::downgrade(&explorer);
-        let popover = popover.clone();
+        let popover = popover.downgrade();
         move |_| {
             if let Some(explorer) = explorer.upgrade() {
                 let selected = explorer.selection.selection();
@@ -610,13 +633,17 @@ pub fn view(start: PathBuf, home: PathBuf, icon_size: i32, operations: Rc<Operat
                     explorer.activate(selected.minimum());
                 }
             }
-            popover.popdown();
+            if let Some(popover) = popover.upgrade() {
+                popover.popdown();
+            }
         }
     });
     open_with.connect_clicked(with_explorer(&explorer, {
-        let popover = popover.clone();
+        let popover = popover.downgrade();
         move |explorer| {
-            popover.popdown();
+            if let Some(popover) = popover.upgrade() {
+                popover.popdown();
+            }
             if let Some(dialog) = explorer.open_with_dialog() {
                 dialog.present();
             }
@@ -624,52 +651,62 @@ pub fn view(start: PathBuf, home: PathBuf, icon_size: i32, operations: Rc<Operat
     }));
     rename.connect_clicked({
         let explorer = Rc::downgrade(&explorer);
-        let popover = popover.clone();
+        let popover = popover.downgrade();
         move |_| {
             if let Some(explorer) = explorer.upgrade() {
                 explorer.show_rename();
             }
-            popover.popdown();
+            if let Some(popover) = popover.upgrade() {
+                popover.popdown();
+            }
         }
     });
     copy.connect_clicked({
         let explorer = Rc::downgrade(&explorer);
-        let popover = popover.clone();
+        let popover = popover.downgrade();
         move |_| {
             if let Some(explorer) = explorer.upgrade() {
                 explorer.copy_selected(false);
             }
-            popover.popdown();
+            if let Some(popover) = popover.upgrade() {
+                popover.popdown();
+            }
         }
     });
     cut.connect_clicked({
         let explorer = Rc::downgrade(&explorer);
-        let popover = popover.clone();
+        let popover = popover.downgrade();
         move |_| {
             if let Some(explorer) = explorer.upgrade() {
                 explorer.copy_selected(true);
             }
-            popover.popdown();
+            if let Some(popover) = popover.upgrade() {
+                popover.popdown();
+            }
         }
     });
     paste.connect_clicked({
         let explorer = Rc::downgrade(&explorer);
-        let popover = popover.clone();
+        let popover = popover.downgrade();
         move |_| {
             if let Some(explorer) = explorer.upgrade() {
                 explorer.paste();
             }
-            popover.popdown();
+            if let Some(popover) = popover.upgrade() {
+                popover.popdown();
+            }
         }
     });
     trash.connect_clicked({
         let explorer = Rc::downgrade(&explorer);
-        let popover = popover.clone();
+        let popover = popover.downgrade();
         move |_| {
             if let Some(explorer) = explorer.upgrade() {
                 explorer.confirm_trash();
             }
-            popover.popdown();
+            if let Some(popover) = popover.upgrade() {
+                popover.popdown();
+            }
         }
     });
     let keys = gtk::EventControllerKey::new();
@@ -722,11 +759,11 @@ pub fn view(start: PathBuf, home: PathBuf, icon_size: i32, operations: Rc<Operat
                 true
             } else if alt && key == gtk::gdk::Key::Up {
                 if let Some(parent) = explorer.current.borrow().parent() {
-                    explorer.navigate(parent, true);
+                    explorer.navigate(parent, Navigation::Visit);
                 }
                 true
             } else if alt && key == gtk::gdk::Key::Home {
-                explorer.navigate(explorer.home.clone(), true);
+                explorer.navigate(explorer.home.clone(), Navigation::Visit);
                 true
             } else if control && key == gtk::gdk::Key::q {
                 explorer.confirm_quit();
@@ -775,7 +812,9 @@ pub fn view(start: PathBuf, home: PathBuf, icon_size: i32, operations: Rc<Operat
     });
     root.connect_destroy({
         let explorer = explorer.clone();
+        let popover = popover.clone();
         move |_| {
+            popover.unparent();
             let _ = &explorer;
         }
     });
@@ -816,12 +855,10 @@ where
 impl Explorer {
     fn refresh(self: &Rc<Self>) {
         let current = self.current.borrow().clone();
-        // Setting the same file again is a no-op; clear it to force a fresh listing.
-        self.directory.set_file(gio::File::NONE);
-        self.navigate(current, false);
+        self.navigate(current, Navigation::Reload);
     }
 
-    fn navigate(self: &Rc<Self>, target: gio::File, save_history: bool) {
+    fn navigate(self: &Rc<Self>, target: gio::File, navigation: Navigation) {
         let Some(path) = target.path() else {
             self.show_error("only local folders are supported");
             return;
@@ -846,14 +883,27 @@ impl Explorer {
             }
             match result {
                 Ok(_) => {
-                    if save_history {
-                        explorer
-                            .back
-                            .borrow_mut()
-                            .push(explorer.current.borrow().clone());
-                        explorer.forward.borrow_mut().clear();
+                    let current = explorer.current.borrow().clone();
+                    match navigation {
+                        Navigation::Visit if !current.equal(&target) => {
+                            explorer.back.borrow_mut().push(current);
+                            explorer.forward.borrow_mut().clear();
+                        }
+                        Navigation::Back => {
+                            explorer.back.borrow_mut().pop();
+                            explorer.forward.borrow_mut().push(current);
+                        }
+                        Navigation::Forward => {
+                            explorer.forward.borrow_mut().pop();
+                            explorer.back.borrow_mut().push(current);
+                        }
+                        _ => {}
                     }
                     *explorer.current.borrow_mut() = target.clone();
+                    if navigation == Navigation::Reload {
+                        // Setting the same file is a no-op. Reset only after validation succeeds.
+                        explorer.directory.set_file(gio::File::NONE);
+                    }
                     explorer.directory.set_file(Some(&target));
                     explorer.error_label.set_visible(false);
                     explorer.recovery.set_visible(false);
@@ -867,21 +917,17 @@ impl Explorer {
     }
 
     fn go_back(self: &Rc<Self>) {
-        let Some(target) = self.back.borrow_mut().pop() else {
+        let Some(target) = self.back.borrow().last().cloned() else {
             return;
         };
-        self.forward
-            .borrow_mut()
-            .push(self.current.borrow().clone());
-        self.navigate(target, false);
+        self.navigate(target, Navigation::Back);
     }
 
     fn go_forward(self: &Rc<Self>) {
-        let Some(target) = self.forward.borrow_mut().pop() else {
+        let Some(target) = self.forward.borrow().last().cloned() else {
             return;
         };
-        self.back.borrow_mut().push(self.current.borrow().clone());
-        self.navigate(target, false);
+        self.navigate(target, Navigation::Forward);
     }
 
     fn activate(self: &Rc<Self>, position: u32) {
@@ -896,7 +942,7 @@ impl Explorer {
         let file_type =
             child.query_file_type(gio::FileQueryInfoFlags::NONE, gio::Cancellable::NONE);
         if file_type == gio::FileType::Directory {
-            self.navigate(child, true);
+            self.navigate(child, Navigation::Visit);
         } else if info.is_symlink() && file_type == gio::FileType::Unknown {
             self.show_error("broken symbolic link");
         } else {
@@ -1344,9 +1390,11 @@ mod tests {
             .selection
             .select_item(position("Cargo.toml").unwrap(), true);
         let dialog = explorer.open_with_dialog().unwrap();
-        assert_eq!(
-            dialog.gfile().unwrap(),
-            explorer.current.borrow().child("Cargo.toml")
+        assert!(
+            dialog
+                .gfile()
+                .unwrap()
+                .equal(&explorer.current.borrow().child("Cargo.toml"))
         );
         let previous_error = explorer.error_label.text();
         dialog.response(gtk::ResponseType::Cancel);
@@ -1382,10 +1430,41 @@ mod tests {
             Some("Quit Kora")
         );
 
+        let item: gtk::ListItem = glib::Object::new();
+        let weak_item = item.downgrade();
+        view.grid
+            .factory()
+            .unwrap()
+            .emit_by_name::<()>("setup", &[&item]);
+        drop(item);
+        assert!(
+            weak_item.upgrade().is_none(),
+            "drop handlers must not retain retired list items"
+        );
+
+        let current = explorer.current.borrow().clone();
+        let back_before = explorer.back.borrow().clone();
+        let forward_before = explorer.forward.borrow().clone();
+        explorer.go_forward();
+        explorer.go_forward();
+        wait(&|| explorer.current.borrow().path().unwrap().ends_with("src"));
+        assert_eq!(explorer.back.borrow().len(), back_before.len() + 1);
+        assert_eq!(explorer.forward.borrow().len(), forward_before.len() - 1);
+        explorer.go_back();
+        wait(&|| explorer.current.borrow().equal(&current));
+        let missing = gio::File::for_path(temp_path("missing-history"));
+        explorer.back.borrow_mut().push(missing);
+        explorer.go_back();
+        wait(&|| explorer.recovery.is_visible());
+        assert!(explorer.current.borrow().equal(&current));
+        assert_eq!(explorer.back.borrow().len(), back_before.len() + 1);
+        assert_eq!(*explorer.forward.borrow(), forward_before);
+        explorer.back.borrow_mut().pop();
+
         let directory = temp_path("refresh");
         fs::create_dir(&directory).unwrap();
         fs::write(directory.join("before"), "before").unwrap();
-        explorer.navigate(gio::File::for_path(&directory), true);
+        explorer.navigate(gio::File::for_path(&directory), Navigation::Visit);
         wait(&|| !explorer.directory.is_loading() && position("before").is_some());
         explorer.directory.set_monitored(false);
         let back_before = explorer.back.borrow().clone();
@@ -1399,8 +1478,87 @@ mod tests {
         assert_eq!(explorer.current.borrow().path().unwrap(), directory);
         assert_eq!(*explorer.back.borrow(), back_before);
         assert_eq!(*explorer.forward.borrow(), forward_before);
+        let moved = temp_path("refresh-moved");
+        fs::rename(&directory, &moved).unwrap();
+        explorer.refresh();
+        wait(&|| explorer.recovery.is_visible());
+        assert!(
+            position("after").is_some(),
+            "failed refresh must preserve the visible listing"
+        );
+        fs::rename(&moved, &directory).unwrap();
+
+        let retry_target = temp_path("retry");
+        explorer.navigate(gio::File::for_path(&retry_target), Navigation::Visit);
+        wait(&|| {
+            explorer.path_entry.text().as_str() == retry_target.to_string_lossy().as_ref()
+                && explorer.recovery.is_visible()
+        });
+        // Let the pending request fail before creating the folder it will retry.
+        wait(&|| {
+            explorer
+                .error_label
+                .text()
+                .contains(retry_target.to_string_lossy().as_ref())
+        });
+        fs::create_dir(&retry_target).unwrap();
+        fs::write(retry_target.join("retried"), "retried").unwrap();
+        explorer
+            .recovery
+            .first_child()
+            .unwrap()
+            .downcast::<gtk::Button>()
+            .unwrap()
+            .emit_clicked();
+        wait(&|| position("retried").is_some());
+        assert_eq!(explorer.current.borrow().path().unwrap(), retry_target);
         explorer.directory.set_file(gio::File::NONE);
+        fs::remove_dir_all(retry_target).unwrap();
         fs::remove_dir_all(directory).unwrap();
+
+        let queue = OperationQueue::new(&app);
+        let completed = Rc::new(Cell::new(false));
+        queue
+            .enqueue_with_callback(Operation::Trash { paths: vec![] }, {
+                let queue = queue.clone();
+                let completed = completed.clone();
+                move |success| {
+                    assert!(!success);
+                    queue
+                        .enqueue_with_callback(Operation::Trash { paths: vec![] }, move |success| {
+                            assert!(!success);
+                            completed.set(true);
+                        })
+                        .unwrap();
+                }
+            })
+            .unwrap();
+        wait(&|| completed.get());
+        assert!(!queue.is_active());
+        drop(queue);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        wait(&|| !glib::MainContext::default().pending());
+
+        let weak_more = more.popover().unwrap().downgrade();
+        let weak_grid = view.grid.downgrade();
+        let weak_explorer = Rc::downgrade(explorer);
+        drop(more_menu);
+        drop(more);
+        drop(back);
+        drop(hidden);
+        drop(view);
+        assert!(
+            weak_explorer.upgrade().is_none(),
+            "views must release explorer state"
+        );
+        assert!(
+            weak_grid.upgrade().is_none(),
+            "views must release their grid"
+        );
+        assert!(
+            weak_more.upgrade().is_none(),
+            "menu callbacks must not retain their parent popover"
+        );
     }
 
     #[test]

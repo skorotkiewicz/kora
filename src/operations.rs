@@ -164,6 +164,7 @@ impl OperationQueue {
         glib::source::unix_fd_add_local(reader.as_raw_fd(), glib::IOCondition::IN, move |_, _| {
             let mut bytes = [0; 64];
             match reader.read(&mut bytes) {
+                Ok(0) => return glib::ControlFlow::Break,
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(_) => return glib::ControlFlow::Break,
@@ -187,7 +188,8 @@ impl OperationQueue {
             });
             for result in completed {
                 source_holds.borrow_mut().pop_front();
-                if let Some(callback) = source_callbacks.borrow_mut().remove(&result.id) {
+                let callback = source_callbacks.borrow_mut().remove(&result.id);
+                if let Some(callback) = callback {
                     callback(result.items.iter().all(|item| item.error.is_none()));
                 }
             }
